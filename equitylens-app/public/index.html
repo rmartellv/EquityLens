@@ -139,6 +139,20 @@ tbody tr:hover{background:#FAFBFD;}
 .progress-fill{height:100%;background:var(--accent);transition:width .3s;}
 .job-log{background:var(--surface-2);border-radius:8px;padding:10px 12px;font-family:'JetBrains Mono',monospace;font-size:10.5px;color:var(--muted);max-height:140px;overflow-y:auto;display:flex;flex-direction:column;gap:3px;}
 .warn-box{background:rgba(180,83,9,.08);border:1px solid rgba(180,83,9,.25);color:var(--amber);border-radius:8px;padding:10px 12px;font-size:11.5px;line-height:1.5;}
+.flag-row{display:flex;flex-direction:column;gap:6px;}
+.flag{border-radius:8px;padding:9px 12px;font-size:11.5px;line-height:1.5;}
+.flag-warn{background:rgba(180,83,9,.08);border:1px solid rgba(180,83,9,.25);color:var(--amber);}
+.flag-info{background:rgba(15,76,129,.06);border:1px solid rgba(15,76,129,.18);color:var(--accent);}
+.flag-ok{background:rgba(21,128,61,.08);border:1px solid rgba(21,128,61,.2);color:var(--green);}
+.target-input{width:52px;background:var(--surface-2);border:1px solid var(--border);border-radius:5px;padding:3px 5px;font-family:'JetBrains Mono',monospace;font-size:11.5px;text-align:right;color:var(--text);}
+.score-badge{font-family:'JetBrains Mono',monospace;font-weight:700;font-size:13px;padding:4px 9px;border-radius:6px;}
+.score-badge.bullish{background:rgba(21,128,61,.12);color:var(--green);}
+.score-badge.bearish{background:rgba(220,38,38,.12);color:var(--red);}
+.score-badge.fair{background:rgba(180,83,9,.12);color:var(--amber);}
+.score-badge.neutral{background:rgba(148,163,184,.18);color:var(--muted);}
+.score-bar-row{display:flex;align-items:center;gap:8px;font-size:10.5px;color:var(--muted);}
+.score-bar-track{flex:1;height:6px;border-radius:3px;background:var(--surface-2);overflow:hidden;}
+.score-bar-fill{height:100%;background:var(--accent-light);}
 
 .heat-cell{text-align:center;font-family:'JetBrains Mono',monospace;font-size:10.5px;padding:8px 4px;border:1px solid var(--border);}
 .range-bar{height:7px;border-radius:4px;background:var(--surface-2);position:relative;margin-top:8px;}
@@ -154,7 +168,7 @@ canvas{max-width:100%;}
 <div class="nav">
   <div>
     <div class="nav-brand">Equity<span>Lens</span></div>
-    <div class="nav-tag">MVP 3 · Screener + Live Data</div>
+    <div class="nav-tag">MVP 5 · Portfolio Mgmt + Dividends/News</div>
   </div>
   <div class="nav-links" id="navLinks"></div>
   <div class="data-status" id="dataStatus">Loading…</div>
@@ -234,6 +248,13 @@ const KNOWN_AT_START = new Set(TICKERS);
 // Mock analyst consensus (illustrative — mirrors the shape of Alpha Vantage's
 // OVERVIEW AnalystRating*/AnalystTargetPrice fields). ETFs are excluded since
 // they don't carry sell-side ratings. Live refresh overwrites these per ticker.
+// Mock market cap (illustrative, USD) — needed for the style-box size bucket.
+// ETFs deliberately excluded (AUM isn't the same concept as equity market cap);
+// live refresh overwrites these with real MarketCapitalization from OVERVIEW.
+const MOCK_MARKETCAP = {
+  NVDA:3.35e12, MSFT:3.30e12, GOOGL:2.15e12, AAPL:3.40e12, META:1.30e12,
+  JPM:620e9, V:600e9, SHEL:205e9, XOM:480e9, AMZN:2.10e12, TSLA:840e9,
+};
 const MOCK_ANALYST = {
   NVDA: { analystStrongBuy:28, analystBuy:9,  analystHold:3,  analystSell:0, analystStrongSell:0, analystTargetPrice:162.50 },
   MSFT: { analystStrongBuy:22, analystBuy:12, analystHold:2,  analystSell:0, analystStrongSell:0, analystTargetPrice:485.00 },
@@ -262,6 +283,7 @@ TICKERS.forEach(t=>{
   UNIVERSE[t].dataSource = "mock";
   UNIVERSE[t].lastRefreshed = null;
   if(MOCK_ANALYST[t]) Object.assign(UNIVERSE[t], MOCK_ANALYST[t]);
+  if(MOCK_MARKETCAP[t]) UNIVERSE[t].marketCap = MOCK_MARKETCAP[t];
 });
 let BENCH_RETURNS_FULL = MOCK_BENCH_RETURNS;
 
@@ -327,6 +349,13 @@ function ensureTickerExists(ticker, fallback){
     const pf = PRICES_FULL[ticker];
     UNIVERSE[ticker].price = pf[pf.length-1];
   }
+  // Defensive: also seed the windowed RETURNS/PRICES globals directly (not just
+  // _FULL) so this function is self-contained — any caller that adds a ticker
+  // and immediately touches portfolio/risk calcs is safe even if it forgets to
+  // call rebuildRiskWindow() afterward. rebuildRiskWindow() (called by every
+  // real call site) will simply recompute the same values from _FULL.
+  if(!RETURNS[ticker]) RETURNS[ticker] = RETURNS_FULL[ticker].slice(-RISK_WINDOW);
+  if(!PRICES[ticker]) PRICES[ticker] = PRICES_FULL[ticker].slice(-(RISK_WINDOW+1));
 }
 
 /* =========================================================================
@@ -368,6 +397,8 @@ async function loadLiveData(){
       POSITION_META[t] = { avgCost:pos.avgCost, currency:pos.currency||"USD", market:pos.market||"US", purchaseDate:pos.purchaseDate||null };
     });
     if(json.fxRates) FX_RATES = { ...FX_RATES, ...json.fxRates };
+    Object.keys(json.dividends||{}).forEach(t=>{ DIVIDENDS[t] = json.dividends[t]; });
+    Object.keys(json.newsSentiment||{}).forEach(t=>{ NEWS_SENTIMENT[t] = json.newsSentiment[t]; });
     rebuildRiskWindow();
     recomputeStockStats();
   } catch(e){ /* server not running — stay on mock engine */ }
@@ -563,6 +594,219 @@ function momentumScore(prices){
   return rocComponent*0.7 + rsiComponent*0.3;
 }
 
+/* =========================================================================
+   PORTFOLIO MANAGEMENT — scenario stress testing, rebalancing, concentration/
+   correlation flags, style box, composite score, Monte Carlo, empirical VaR.
+   Pure functions on data already computed above — no new API calls needed
+   for any of this; it's the "core practice" list from the V5 feature roadmap.
+   ========================================================================= */
+
+// --- Scenario stress testing: shock the benchmark, propagate via existing betas ---
+const STRESS_SCENARIOS = [
+  { key:"gfc2008",       label:"2008 Financial Crisis (-38%)",      shock:-0.38 },
+  { key:"covid2020",     label:"2020 COVID Crash (-34%)",           shock:-0.34 },
+  { key:"ratesock2022",  label:"2022 Rate-Driven Selloff (-25%)",   shock:-0.25 },
+  { key:"correction",    label:"Standard Correction (-10%)",        shock:-0.10 },
+  { key:"rally",         label:"Strong Rally (+15%)",                shock:0.15 },
+];
+// Factor-based stress testing: overrides the normal covariance assumptions
+// behind parametric VaR with one deterministic market move, propagated through
+// each position's beta. Idiosyncratic (stock-specific) risk isn't modeled in
+// a scenario shock — that's the standard simplification this approach makes.
+function scenarioImpact(positions, weights, totalValue, shockPct){
+  let deltaValue = 0;
+  const byPosition = positions.map(p=>{
+    const beta = STOCK_BETA[p.ticker] ?? 1;
+    const posReturn = beta * shockPct;
+    const posDelta = p.value * posReturn;
+    deltaValue += posDelta;
+    return { ticker:p.ticker, beta, posReturn, posDelta };
+  }).sort((a,b)=>a.posDelta-b.posDelta);
+  return { totalValue, deltaValue, newValue: totalValue+deltaValue, pctImpact: totalValue>0?deltaValue/totalValue:0, byPosition };
+}
+
+// --- Rebalancing: drift from a user-set target weight, suggested trade to close it ---
+function rebalanceSuggestion(currentWeight, targetWeight, totalValue){
+  const drift = (currentWeight??0) - (targetWeight??currentWeight??0);
+  const targetValue = (targetWeight??currentWeight??0) * totalValue;
+  const currentValue = (currentWeight??0) * totalValue;
+  return { drift, tradeValue: targetValue - currentValue }; // positive = buy, negative = sell
+}
+
+// --- Concentration & correlation risk flags ---
+function concentrationFlags(positions, weights, opts={}){
+  const posThreshold = opts.posThreshold ?? 0.20;
+  const sectorThreshold = opts.sectorThreshold ?? 0.35;
+  const corrThreshold = opts.corrThreshold ?? 0.70;
+  const flags = [];
+  positions.forEach(p=>{
+    const w = weights[p.ticker]||0;
+    if(w >= posThreshold) flags.push({ level:"warn", text:`${p.ticker} is ${fmtPlain(w)} of the portfolio — above the ${fmtPlain(posThreshold,0)} single-position threshold.` });
+  });
+  const sectorMap = {};
+  positions.forEach(p=>{ const sec=p.sector||"Unknown"; sectorMap[sec]=(sectorMap[sec]||0)+(weights[p.ticker]||0); });
+  Object.entries(sectorMap).forEach(([sec,w])=>{
+    if(w >= sectorThreshold) flags.push({ level:"warn", text:`${sec} sector is ${fmtPlain(w)} of the portfolio — above the ${fmtPlain(sectorThreshold,0)} sector threshold.` });
+  });
+  const tickers = positions.map(p=>p.ticker);
+  for(let i=0;i<tickers.length;i++){
+    for(let j=i+1;j<tickers.length;j++){
+      const t1=tickers[i], t2=tickers[j];
+      if(!RETURNS[t1]||!RETURNS[t2]) continue;
+      const c = correlation(RETURNS[t1],RETURNS[t2]);
+      if(c >= corrThreshold){
+        const combined = (weights[t1]||0)+(weights[t2]||0);
+        flags.push({ level:"info", text:`${t1} and ${t2} correlate at ${fmtNum(c,2)} (combined ${fmtPlain(combined)} of NAV) — moves together, not true diversification.` });
+      }
+    }
+  }
+  if(flags.length===0) flags.push({ level:"ok", text:"No concentration or correlation flags at current thresholds." });
+  return flags;
+}
+
+// --- Liquidity: days to liquidate a position at its average daily volume ---
+function daysToLiquidate(shares, avgVolumeM){
+  if(!avgVolumeM || avgVolumeM<=0) return null;
+  return shares / (avgVolumeM*1e6);
+}
+// Assumes only 20% of a day's average volume can be sold without moving the
+// price — a standard rule-of-thumb liquidity constraint, not a hard limit.
+function liquidityFlags(positions, opts={}){
+  const dayThreshold = opts.dayThreshold ?? 1;
+  const participationRate = opts.participationRate ?? 0.20;
+  const flags = [];
+  positions.forEach(p=>{
+    const rawDays = daysToLiquidate(p.shares, p.avgVolume);
+    if(rawDays==null) return;
+    const days = rawDays/participationRate;
+    if(days >= dayThreshold){
+      flags.push({ level:"info", text:`${p.ticker}: ~${fmtNum(days,1)} trading days to exit at 20% of average daily volume (${fmtNum(p.avgVolume,1)}M shares/day) without materially moving the price.` });
+    }
+  });
+  return flags;
+}
+
+// --- Style box: size (market cap) x style (P/E percentile as a value/growth proxy) ---
+function sizeBucket(marketCap){
+  if(marketCap==null) return "Mid"; // ETFs / unknown default to the middle bucket
+  if(marketCap >= 200e9) return "Large";
+  if(marketCap >= 10e9) return "Mid";
+  return "Small";
+}
+function styleBucketOf(pePctl){
+  if(pePctl==null) return "Blend";
+  if(pePctl <= 0.33) return "Value";
+  if(pePctl >= 0.67) return "Growth";
+  return "Blend";
+}
+function styleBoxWeights(positions, weights){
+  const sizes=["Large","Mid","Small"], styles=["Value","Blend","Growth"];
+  const grid = {};
+  sizes.forEach(sz=>styles.forEach(st=>grid[`${sz}/${st}`]=0));
+  positions.forEach(p=>{
+    const sz = sizeBucket(p.marketCap);
+    const st = styleBucketOf(STOCK_PE_PCTL[p.ticker]);
+    grid[`${sz}/${st}`] += weights[p.ticker]||0;
+  });
+  return grid;
+}
+
+// --- Composite score: blends already-computed percentiles into one 0-100 signal,
+//     same idea as Simply Wall St's Snowflake / Seeking Alpha's Quant Rating. ---
+function compositeScore(t){
+  const s = UNIVERSE[t];
+  const parts = [];
+  if(STOCK_PE_PCTL[t]!=null) parts.push({ w:0.30, v:(1-STOCK_PE_PCTL[t])*100 });          // cheap vs. history -> high score
+  if(STOCK_MOM[t]!=null) parts.push({ w:0.30, v:Math.max(0,Math.min(100,(STOCK_MOM[t]+0.5)*100)) }); // momentum
+  if(s.roe!=null) parts.push({ w:0.20, v:Math.max(0,Math.min(100,(s.roe/0.30)*100)) });    // quality (ROE)
+  if(s.revGrowth!=null) parts.push({ w:0.20, v:Math.max(0,Math.min(100,(s.revGrowth/0.30)*100)) }); // growth
+  if(parts.length===0) return null;
+  const totalW = parts.reduce((a,p)=>a+p.w,0);
+  return Math.round(parts.reduce((a,p)=>a+p.w*p.v,0)/totalW);
+}
+function compositeScoreBreakdown(t){
+  const s = UNIVERSE[t];
+  return {
+    valuation: STOCK_PE_PCTL[t]!=null ? Math.round((1-STOCK_PE_PCTL[t])*100) : null,
+    momentum: STOCK_MOM[t]!=null ? Math.round(Math.max(0,Math.min(100,(STOCK_MOM[t]+0.5)*100))) : null,
+    quality: s.roe!=null ? Math.round(Math.max(0,Math.min(100,(s.roe/0.30)*100))) : null,
+    growth: s.revGrowth!=null ? Math.round(Math.max(0,Math.min(100,(s.revGrowth/0.30)*100))) : null,
+  };
+}
+function scoreClass(score){
+  if(score==null) return "neutral";
+  if(score>=65) return "bullish";
+  if(score<=35) return "bearish";
+  return "fair";
+}
+
+// --- Monte Carlo: GBM forward simulation of portfolio value, sampled at checkpoints ---
+function monteCarloFanSeries(startValue, annReturn, annVol, horizonDays, numPaths, checkpoints, seed=42){
+  const rand = mulberry32(seed);
+  const dt = 1/TRADING_DAYS_PER_YEAR;
+  const drift = (annReturn - 0.5*annVol*annVol) * dt;
+  const vol = annVol * Math.sqrt(dt);
+  const series = checkpoints.map(()=>[]);
+  for(let p=0; p<numPaths; p++){
+    let v = startValue; let ci = 0;
+    for(let d=1; d<=horizonDays; d++){
+      const u1 = Math.max(rand(), 1e-9), u2 = rand();
+      const z = Math.sqrt(-2*Math.log(u1))*Math.cos(2*Math.PI*u2); // Box-Muller standard normal
+      v = v * Math.exp(drift + vol*z);
+      if(ci<checkpoints.length && d===checkpoints[ci]){ series[ci].push(v); ci++; }
+    }
+  }
+  const pct = (arr,q) => { const s=[...arr].sort((a,b)=>a-b); return s.length?s[Math.min(s.length-1,Math.max(0,Math.round(q*(s.length-1))))]:startValue; };
+  return checkpoints.map((day,i)=>({ day, p05:pct(series[i],0.05), p25:pct(series[i],0.25), p50:pct(series[i],0.50), p75:pct(series[i],0.75), p95:pct(series[i],0.95) }));
+}
+
+// --- Empirical (historical-simulation) VaR/CVaR — doesn't assume normal returns,
+//     a natural pairing with the parametric version already in the risk-kpis skill. ---
+function empiricalVaR(portfolioValue, dailyReturns, confidence=0.95){
+  const sorted = [...dailyReturns].sort((a,b)=>a-b);
+  const idx = Math.max(0, Math.floor((1-confidence)*sorted.length)-1);
+  const pct = Math.abs(Math.min(0, sorted[idx] ?? 0));
+  return { pct, value: portfolioValue*pct };
+}
+function empiricalCVaR(portfolioValue, dailyReturns, confidence=0.95){
+  const sorted = [...dailyReturns].sort((a,b)=>a-b);
+  const cutoff = Math.max(1, Math.floor((1-confidence)*sorted.length));
+  const tail = sorted.slice(0, cutoff);
+  const pct = Math.abs(Math.min(0, tail.length?mean(tail):0));
+  return { pct, value: portfolioValue*pct };
+}
+
+// --- Unrealized P&L (now that avgCost is tracked per position via Excel import) ---
+function unrealizedPnL(shares, avgCost, price){
+  if(avgCost==null || price==null) return { dollar:null, pct:null };
+  return { dollar: shares*(price-avgCost), pct: avgCost>0 ? (price-avgCost)/avgCost : null };
+}
+
+// --- Dividend income: prefers real trailing-12mo history (DIVIDENDS endpoint,
+//     opt-in on refresh), falls back to current-yield x price when unavailable ---
+function trailingDividendPerShare(ticker){
+  const d = DIVIDENDS[ticker];
+  if(d && d.history && d.history.length){
+    const oneYearAgo = new Date(); oneYearAgo.setFullYear(oneYearAgo.getFullYear()-1);
+    const recent = d.history.filter(h=>{ const dt=new Date(h.exDate); return !isNaN(dt) && dt >= oneYearAgo; });
+    const sum = recent.reduce((a,h)=>a+(h.amount||0),0);
+    if(sum>0) return { perShare: sum, source:"history" };
+  }
+  const s = UNIVERSE[ticker];
+  if(s && s.divYield && s.price) return { perShare: s.divYield*s.price, source:"yield" };
+  return { perShare:0, source:"none" };
+}
+function portfolioDividendIncome(positions){
+  let annualIncome=0;
+  const rows = positions.map(p=>{
+    const info = trailingDividendPerShare(p.ticker);
+    const income = p.shares*info.perShare;
+    annualIncome += income;
+    return { ticker:p.ticker, perShare:info.perShare, source:info.source, income };
+  }).filter(r=>r.income>0).sort((a,b)=>b.income-a.income);
+  return { annualIncome, rows };
+}
+
 // Precompute per-stock stats (recomputed whenever live data lands)
 const STOCK_BETA={}, STOCK_SHARPE={}, STOCK_ANNVOL={}, STOCK_ANNRET={}, STOCK_MAXDD={}, STOCK_RSQ={};
 const STOCK_RSI={}, STOCK_ROC20={}, STOCK_ROC60={}, STOCK_TREND={}, STOCK_MOM={}, STOCK_PE_PCTL={}, STOCK_VAL_TAG={};
@@ -629,9 +873,15 @@ let state = {
   importModalOpen:false,
   importRows:null,
   importError:null,
+  targetWeights:{},       // ticker -> target weight (0-1), user-editable; unset = no drift
+  stressScenario:"correction",
+  includeExtras:false,    // opt-in dividends + news sentiment on refresh (+2 API calls/ticker)
 };
+const DIVIDENDS = {};      // ticker -> { history:[{exDate,payDate,amount}], lastRefreshed }
+const NEWS_SENTIMENT = {}; // ticker -> { avgScore, articleCount, headlines:[...], lastRefreshed }
 let chartRegistry={};
 function destroyCharts(){ Object.values(chartRegistry).forEach(c=>c&&c.destroy()); chartRegistry={}; }
+let MC_CACHE = null; // cached Monte Carlo fan series, keyed by a totalValue/annReturn/annVol signature
 
 function getPositions(){
   return Object.keys(state.portfolio)
@@ -817,6 +1067,21 @@ function viewDetail(ticker){
       </div>
     </div>
     <div>
+      <div class="section-label">EquityLens Score</div>
+      <div class="table-card" style="padding:18px 20px;">
+        ${(()=>{ const score=compositeScore(ticker); const bd=compositeScoreBreakdown(ticker); return `
+        <div style="display:flex;align-items:center;gap:16px;margin-bottom:14px;">
+          <span class="score-badge ${scoreClass(score)}" style="font-size:20px;padding:8px 16px;">${score ?? "—"}</span>
+          <span style="font-size:12px;color:var(--muted);">Blend of valuation, momentum, quality &amp; growth percentiles already computed elsewhere in this app.</span>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:8px;">
+          ${[["Valuation (cheap vs. history)",bd.valuation],["Momentum",bd.momentum],["Quality (ROE)",bd.quality],["Growth (Rev. YoY)",bd.growth]].map(([label,v])=>`
+            <div class="score-bar-row"><span style="width:150px;">${label}</span><div class="score-bar-track"><div class="score-bar-fill" style="width:${v??0}%;"></div></div><span class="mono" style="width:28px;text-align:right;">${v??"—"}</span></div>
+          `).join("")}
+        </div>`; })()}
+      </div>
+    </div>
+    <div>
       <div class="section-label">Analyst Consensus</div>
       ${!consensus ? `<div class="table-card" style="padding:16px 18px;font-size:12.5px;color:var(--muted);">No analyst rating data ${s.dataSource==="live"?"returned by Alpha Vantage for this ticker.":"— refresh this ticker with live data to pull it (comes from OVERVIEW, no extra API cost)."}</div>` : `
       <div class="table-card" style="padding:18px 20px;display:flex;flex-direction:column;gap:12px;">
@@ -841,6 +1106,27 @@ function viewDetail(ticker){
           </div>
         </div>` : `<div class="footnote">Target price available, but Alpha Vantage returned no buy/hold/sell counts for this ticker.</div>`}
       </div>`}
+    </div>
+    <div class="detail-grid">
+      <div>
+        <div class="section-label">Dividend History</div>
+        ${(()=>{ const d=DIVIDENDS[ticker]; if(!d||!d.history||!d.history.length) return `<div class="table-card" style="padding:16px 18px;font-size:12.5px;color:var(--muted);">No dividend history fetched yet — enable "Include dividends + news sentiment" on your next refresh (Alpha Vantage <code>DIVIDENDS</code>, +1 call). ${s.divYield?`Current yield estimate: ${fmtPlain(s.divYield)}.`:"This ticker shows no current dividend yield."}</div>`;
+          return `<div class="table-card"><table><thead><tr><th>Ex-Date</th><th>Pay Date</th><th class="num">Amount</th></tr></thead>
+          <tbody>${d.history.map(h=>`<tr><td>${h.exDate}</td><td>${h.payDate||"—"}</td><td class="num">$${h.amount.toFixed(4)}</td></tr>`).join("")}</tbody></table></div>
+          <div class="footnote" style="margin-top:8px;">Last ${d.history.length} payments on file, most recent first. Refreshed ${d.lastRefreshed?new Date(d.lastRefreshed).toLocaleString():"—"}.</div>`;
+        })()}
+      </div>
+      <div>
+        <div class="section-label">News Sentiment</div>
+        ${(()=>{ const ns=NEWS_SENTIMENT[ticker]; if(!ns) return `<div class="table-card" style="padding:16px 18px;font-size:12.5px;color:var(--muted);">No news sentiment fetched yet — enable "Include dividends + news sentiment" on your next refresh (Alpha Vantage <code>NEWS_SENTIMENT</code>, +1 call).</div>`;
+          const tag = ns.avgScore==null?"neutral":ns.avgScore>=0.15?"bullish":ns.avgScore<=-0.15?"bearish":"neutral";
+          return `<div class="table-card" style="padding:16px 18px;">
+          <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;"><span class="tag-pill ${tag}" style="font-size:12px;padding:5px 12px;">${ns.avgScore!=null?fmtNum(ns.avgScore,3):"n/a"}</span><span style="font-size:11.5px;color:var(--muted);">${ns.articleCount} articles, relevance-weighted average</span></div>
+          <div style="display:flex;flex-direction:column;gap:8px;">${ns.headlines.map(h=>`<div style="font-size:11.5px;line-height:1.4;"><span style="color:var(--muted);">${h.source||""}</span> — ${h.title}</div>`).join("")}</div>
+          </div>
+          <div class="footnote" style="margin-top:8px;">Refreshed ${ns.lastRefreshed?new Date(ns.lastRefreshed).toLocaleString():"—"}.</div>`;
+        })()}
+      </div>
     </div>
     <div>
       <div class="section-label">Fundamentals</div>
@@ -873,11 +1159,21 @@ function viewPortfolio(){
   const sectorMap={};
   positions.forEach(p=>{ const sec=p.sector||"Unknown"; sectorMap[sec]=(sectorMap[sec]||0)+p.value; });
 
+  let flags = concentrationFlags(positions, weights).filter(f=>f.level!=="ok");
+  flags = flags.concat(liquidityFlags(positions));
+  if(flags.length===0) flags = [{ level:"ok", text:"No concentration, correlation, or liquidity flags at current thresholds." }];
+  const empVar = risk ? empiricalVaR(totalValue, risk.portRet, 0.95) : null;
+  const empCvar = risk ? empiricalCVaR(totalValue, risk.portRet, 0.95) : null;
+  const scenario = STRESS_SCENARIOS.find(s=>s.key===state.stressScenario) || STRESS_SCENARIOS[0];
+  const stress = risk ? scenarioImpact(positions, weights, totalValue, scenario.shock) : null;
+  const styleGrid = styleBoxWeights(positions, weights);
+  const sizes=["Large","Mid","Small"], styles=["Value","Blend","Growth"];
+
   return `
   <div class="topbar">
     <div>
       <div class="page-heading">Portfolio &amp; Risk</div>
-      <div class="page-sub">${positions.length} positions · rebalanced manually · rf = 3M T-bill (4.3%) · benchmark ${BENCHMARK_NAME}</div>
+      <div class="page-sub">${positions.length} positions · rf = 3M T-bill (4.3%) · benchmark ${BENCHMARK_NAME}</div>
     </div>
     <div style="display:flex;gap:10px;">
       <button class="secondary-btn" id="openImportModal">⇪ Import Portfolio</button>
@@ -896,17 +1192,29 @@ function viewPortfolio(){
       </div>
     </div>
 
+    <div>
+      <div class="section-label">Risk Flags — concentration &amp; correlation</div>
+      <div class="flag-row">
+        ${flags.map(f=>`<div class="flag flag-${f.level}">${f.text}</div>`).join("")}
+      </div>
+    </div>
+
     <div class="risk-grid">
       <div>
-        <div class="section-label">Holdings</div>
+        <div class="section-label">Holdings &amp; Rebalancing <span style="font-weight:400;font-style:italic;color:var(--muted);text-transform:none;letter-spacing:0;">— set a target % to track drift</span></div>
         <div class="table-card">
           ${positions.length===0 ? `<div style="padding:24px;font-size:13px;color:var(--muted);">No positions yet. Click "+ Add Stock" to build a portfolio.</div>` : `
           <table>
-            <thead><tr><th>Ticker</th><th>Market</th><th class="num">Shares</th><th class="num">Avg Cost</th><th class="num">Price</th><th class="num">Mkt Value (USD)</th><th class="num">Weight</th><th class="num">Day Chg</th><th class="num">Beta</th><th></th></tr></thead>
+            <thead><tr><th>Ticker</th><th>Market</th><th class="num">Shares</th><th class="num">Avg Cost</th><th class="num">Price</th><th class="num">Mkt Value (USD)</th><th class="num">Weight</th><th class="num">Unrealized G/L</th><th class="num">Target %</th><th class="num">Drift</th><th class="num">Day Chg</th><th class="num">Beta</th><th></th></tr></thead>
             <tbody>
             ${positions.map(p=>{
               const pf=PRICES_FULL[p.ticker]; const chg=(pf[pf.length-1]-pf[pf.length-2])/pf[pf.length-2];
               const ccyTag = p.currency && p.currency!=="USD" ? ` <span class="mono" style="font-size:9.5px;color:var(--muted);">${p.currency}${!p.fxKnown?" ⚠":""}</span>` : "";
+              const pnl = unrealizedPnL(p.shares, p.avgCost, p.price);
+              const targetPct = state.targetWeights[p.ticker];
+              const targetInputVal = targetPct!=null ? (targetPct*100).toFixed(1) : "";
+              const reb = rebalanceSuggestion(weights[p.ticker], targetPct, totalValue);
+              const hasTarget = targetPct!=null;
               return `<tr>
                 <td class="name-cell" data-open="${p.ticker}" style="cursor:pointer;"><span class="ticker-tag">${p.ticker}</span> <span class="src-pill ${p.dataSource}">${p.dataSource}</span><br><span class="co-name">${p.name}</span></td>
                 <td><span class="sector-pill">${p.market||"US"}</span></td>
@@ -915,6 +1223,9 @@ function viewPortfolio(){
                 <td class="num">${p.price!=null?p.price.toFixed(2):"—"}</td>
                 <td class="num">${Math.round(p.value).toLocaleString()}</td>
                 <td class="num">${fmtPlain(weights[p.ticker])}</td>
+                <td class="num ${pnl.dollar!=null?cls(pnl.dollar):''}">${pnl.dollar!=null?fmtMoney(pnl.dollar)+" ("+fmtPct(pnl.pct)+")":"—"}</td>
+                <td class="num"><input class="target-input" data-target="${p.ticker}" type="number" min="0" max="100" step="0.5" placeholder="—" value="${targetInputVal}"></td>
+                <td class="num ${hasTarget?(Math.abs(reb.drift)>=0.03?'down':''):''}">${hasTarget?fmtPct(reb.drift):"—"}</td>
                 <td class="num ${cls(chg)}">${fmtPct(chg)}</td>
                 <td class="num">${fmtNum(STOCK_BETA[p.ticker])}</td>
                 <td class="num"><button class="remove-btn" data-remove="${p.ticker}">✕</button></td>
@@ -923,21 +1234,40 @@ function viewPortfolio(){
             </tbody>
           </table>`}
         </div>
-        <div class="footnote" style="margin-top:8px;">Weight = market value / total portfolio value. Steppers adjust position size by 10 shares. Non-USD positions are converted at the last-fetched spot FX rate (⚠ = rate not yet available — shown unconverted until refreshed).</div>
+        <div class="footnote" style="margin-top:8px;">Weight = market value / total portfolio value. Unrealized G/L uses cost basis from manual entry or Excel import. Target % is optional per position — drift = current weight − target; |drift| ≥ 3% is flagged red. Non-USD positions convert at the last-fetched spot FX rate (⚠ = rate not yet available).</div>
       </div>
-      <div class="table-card" style="padding:18px;">
-        <div class="section-label">Sector Allocation</div>
-        <canvas id="chartSector" height="200"></canvas>
+      <div style="display:flex;flex-direction:column;gap:14px;">
+        <div class="table-card" style="padding:18px;">
+          <div class="section-label">Sector Allocation</div>
+          <canvas id="chartSector" height="200"></canvas>
+        </div>
+        <div class="table-card" style="padding:18px;">
+          <div class="section-label">Style Box <span style="font-weight:400;font-style:italic;color:var(--muted);text-transform:none;letter-spacing:0;">size × valuation tilt</span></div>
+          <div style="display:grid;grid-template-columns:56px repeat(3,1fr);gap:4px;">
+            <div></div>
+            ${styles.map(st=>`<div class="mono" style="text-align:center;font-size:10px;color:var(--muted);">${st}</div>`).join("")}
+            ${sizes.map(sz=>`
+              <div class="mono" style="font-size:10px;color:var(--muted);align-self:center;">${sz}</div>
+              ${styles.map(st=>{
+                const w = styleGrid[`${sz}/${st}`]||0;
+                const intensity = Math.min(0.85, 0.08+w*2.2);
+                return `<div class="heat-cell" style="background:rgba(15,76,129,${intensity});">${w>0?fmtPlain(w,0):"—"}</div>`;
+              }).join("")}
+            `).join("")}
+          </div>
+          <div class="footnote" style="margin-top:8px;">Size from market cap (Large ≥$200B, Mid ≥$10B); style from P/E-vs-history percentile (cheap third = Value, expensive third = Growth). ETFs default to Mid/Blend.</div>
+        </div>
       </div>
     </div>
 
     <div style="display:grid;grid-template-columns:1fr 1fr 1.4fr;gap:14px;">
       <div class="stat-card">
-        <div class="section-label" style="margin-bottom:10px;">Value at Risk (Parametric, 95%)</div>
-        <div style="display:flex;justify-content:space-between;margin-bottom:6px;"><span style="color:var(--muted);font-size:12px;">1-day VaR</span><span class="stat-value small" style="color:var(--red);">${risk?"-"+fmtMoney(risk.var1d.value):"—"}</span></div>
-        <div style="display:flex;justify-content:space-between;margin-bottom:6px;"><span style="color:var(--muted);font-size:12px;">1-month VaR (21d)</span><span class="stat-value small" style="color:var(--red);">${risk?"-"+fmtMoney(risk.var1m.value):"—"}</span></div>
-        <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);font-size:12px;">1-day CVaR / Exp. Shortfall</span><span class="stat-value small" style="color:var(--red);">${risk?"-"+fmtMoney(risk.cvar1d.value):"—"}</span></div>
-        <div class="footnote" style="margin-top:10px;">Variance-covariance method assumes normally distributed returns — understates true tail risk. Risk window is the trailing ${RISK_WINDOW} sessions.</div>
+        <div class="section-label" style="margin-bottom:10px;">Value at Risk, 95% — Parametric vs. Empirical</div>
+        <div style="display:flex;justify-content:space-between;margin-bottom:6px;"><span style="color:var(--muted);font-size:12px;">1-day VaR (parametric)</span><span class="stat-value small" style="color:var(--red);">${risk?"-"+fmtMoney(risk.var1d.value):"—"}</span></div>
+        <div style="display:flex;justify-content:space-between;margin-bottom:6px;"><span style="color:var(--muted);font-size:12px;">1-day VaR (empirical)</span><span class="stat-value small" style="color:var(--red);">${empVar?"-"+fmtMoney(empVar.value):"—"}</span></div>
+        <div style="display:flex;justify-content:space-between;margin-bottom:6px;"><span style="color:var(--muted);font-size:12px;">1-day CVaR (parametric)</span><span class="stat-value small" style="color:var(--red);">${risk?"-"+fmtMoney(risk.cvar1d.value):"—"}</span></div>
+        <div style="display:flex;justify-content:space-between;"><span style="color:var(--muted);font-size:12px;">1-day CVaR (empirical)</span><span class="stat-value small" style="color:var(--red);">${empCvar?"-"+fmtMoney(empCvar.value):"—"}</span></div>
+        <div class="footnote" style="margin-top:10px;">Parametric assumes normal returns; empirical (historical-simulation) sorts the actual trailing ${RISK_WINDOW}-day returns and reads the 5th percentile directly — no distribution assumption, but noisier with a short window.</div>
       </div>
       <div class="stat-card">
         <div class="section-label" style="margin-bottom:10px;">Diversification</div>
@@ -949,6 +1279,56 @@ function viewPortfolio(){
       <div class="stat-card">
         <div class="section-label" style="margin-bottom:10px;">Correlation Matrix (daily returns, ${RISK_WINDOW}d)</div>
         <div id="corrMatrix"></div>
+      </div>
+    </div>
+
+    <div class="risk-grid">
+      <div class="table-card" style="padding:20px;">
+        <div class="section-label">Scenario Stress Test <span style="font-weight:400;font-style:italic;color:var(--muted);text-transform:none;letter-spacing:0;">factor-based: shocks the benchmark, propagates via each position's beta</span></div>
+        <select id="scenarioSelect" class="mono" style="padding:8px 10px;border:1px solid var(--border);border-radius:7px;background:var(--surface);margin-bottom:14px;">
+          ${STRESS_SCENARIOS.map(s=>`<option value="${s.key}" ${s.key===scenario.key?'selected':''}>${s.label}</option>`).join("")}
+        </select>
+        ${stress ? `
+        <div style="display:flex;gap:18px;margin-bottom:14px;">
+          <div><div class="stat-label">Portfolio Impact</div><div class="stat-value ${cls(stress.deltaValue)}">${fmtMoney(stress.deltaValue)} (${fmtPct(stress.pctImpact)})</div></div>
+          <div><div class="stat-label">Value After Shock</div><div class="stat-value small">${fmtMoney(stress.newValue)}</div></div>
+        </div>
+        <div style="max-height:180px;overflow-y:auto;">
+          <table><thead><tr><th>Ticker</th><th class="num">Beta</th><th class="num">Scenario Return</th><th class="num">Δ Value</th></tr></thead>
+          <tbody>${stress.byPosition.map(b=>`<tr><td class="ticker-tag">${b.ticker}</td><td class="num">${fmtNum(b.beta)}</td><td class="num ${cls(b.posReturn)}">${fmtPct(b.posReturn)}</td><td class="num ${cls(b.posDelta)}">${fmtMoney(b.posDelta)}</td></tr>`).join("")}</tbody></table>
+        </div>
+        <div class="footnote" style="margin-top:10px;">Standard factor-based stress testing simplification: overrides normal covariance assumptions with one deterministic market move, applied through each position's own beta. Idiosyncratic (stock-specific) risk isn't modeled in a scenario shock.</div>` : `<div class="footnote">No positions to stress test.</div>`}
+      </div>
+      <div class="table-card" style="padding:20px;">
+        <div class="section-label">Monte Carlo Projection <span style="font-weight:400;font-style:italic;color:var(--muted);text-transform:none;letter-spacing:0;">1-year, geometric Brownian motion, 300 paths</span></div>
+        <canvas id="chartMonteCarlo" height="200"></canvas>
+        <div id="mcReadout" style="display:flex;gap:18px;margin-top:12px;"></div>
+        <div class="footnote" style="margin-top:10px;">Simulated using the portfolio's own trailing annualized return &amp; volatility (${risk?fmtPct(risk.annReturn):"—"} / ${risk?fmtPlain(risk.annVol):"—"}) as the GBM drift/vol inputs — a projection of what the recent regime implies going forward, not a guarantee.</div>
+      </div>
+    </div>
+
+    <div class="risk-grid">
+      <div class="table-card" style="padding:20px;">
+        <div class="section-label">Dividend Income Projection</div>
+        ${(()=>{ const inc=portfolioDividendIncome(positions); return `
+        <div style="display:flex;gap:18px;margin-bottom:14px;">
+          <div><div class="stat-label">Est. Annual Income</div><div class="stat-value">${fmtMoney(inc.annualIncome)}</div></div>
+          <div><div class="stat-label">Portfolio Yield</div><div class="stat-value small">${totalValue>0?fmtPlain(inc.annualIncome/totalValue):"—"}</div></div>
+        </div>
+        ${inc.rows.length===0 ? `<div class="footnote">No dividend-paying positions detected.</div>` : `
+        <table><thead><tr><th>Ticker</th><th class="num">Per Share (TTM)</th><th class="num">Annual Income</th><th>Source</th></tr></thead>
+        <tbody>${inc.rows.map(r=>`<tr><td class="ticker-tag">${r.ticker}</td><td class="num">${fmtNum(r.perShare,2)}</td><td class="num">${fmtMoney(r.income)}</td><td><span class="src-pill ${r.source==='history'?'live':'mock'}">${r.source==='history'?'DIVIDENDS':'yield est.'}</span></td></tr>`).join("")}</tbody></table>`}
+        <div class="footnote" style="margin-top:10px;">Prefers real trailing-12-month dividend history (Alpha Vantage <code>DIVIDENDS</code>, opt-in on refresh — zero extra cost beyond the 1 call/ticker); falls back to current yield × price when history hasn't been fetched yet.</div>`; })()}
+      </div>
+      <div class="table-card" style="padding:20px;">
+        <div class="section-label">News Sentiment Snapshot</div>
+        ${(()=>{
+          const withSentiment = positions.filter(p=>NEWS_SENTIMENT[p.ticker]);
+          if(withSentiment.length===0) return `<div class="footnote">No news sentiment data yet — enable "Include dividends + news sentiment" on your next refresh (Alpha Vantage <code>NEWS_SENTIMENT</code>, +1 call/ticker).</div>`;
+          return `<table><thead><tr><th>Ticker</th><th class="num">Avg Sentiment</th><th class="num">Articles</th></tr></thead>
+          <tbody>${withSentiment.map(p=>{ const ns=NEWS_SENTIMENT[p.ticker]; const s=ns.avgScore; const tag = s==null?"neutral":s>=0.15?"bullish":s<=-0.15?"bearish":"neutral"; return `<tr><td class="name-cell" data-open="${p.ticker}" style="cursor:pointer;"><span class="ticker-tag">${p.ticker}</span></td><td class="num"><span class="tag-pill ${tag}">${s!=null?fmtNum(s,3):"—"}</span></td><td class="num">${ns.articleCount}</td></tr>`; }).join("")}</tbody></table>
+          <div class="footnote" style="margin-top:10px;">Relevance-weighted average sentiment score across recent headlines, -1 (very bearish) to +1 (very bullish). Full headline list is on each ticker's Stock Detail page.</div>`;
+        })()}
       </div>
     </div>
   </div>`;
@@ -968,12 +1348,13 @@ const SCREENER_COLS = [
   { key:"pePctl", label:"P/E Pctl", num:true },
   { key:"valuation", label:"Valuation" },
   { key:"momentum", label:"Momentum", num:true },
+  { key:"score", label:"Score", num:true },
 ];
 function screenerRows(){
   return TICKERS.map(t=>({
     ticker:t, price:UNIVERSE[t].price, roc20:STOCK_ROC20[t], roc60:STOCK_ROC60[t],
     rsi:STOCK_RSI[t], trend:STOCK_TREND[t], pe:UNIVERSE[t].pe, pePctl:STOCK_PE_PCTL[t],
-    valuation:STOCK_VAL_TAG[t], momentum:STOCK_MOM[t], dataSource:UNIVERSE[t].dataSource, name:UNIVERSE[t].name,
+    valuation:STOCK_VAL_TAG[t], momentum:STOCK_MOM[t], score:compositeScore(t), dataSource:UNIVERSE[t].dataSource, name:UNIVERSE[t].name,
   }));
 }
 function viewScreener(){
@@ -1010,6 +1391,7 @@ function viewScreener(){
             <td class="num">${r.pePctl!=null?fmtPlain(r.pePctl,0):"—"}</td>
             <td><span class="tag-pill ${tagClass(r.valuation)}">${r.valuation}</span></td>
             <td class="num">${fmtNum(r.momentum,3)}</td>
+            <td class="num"><span class="score-badge ${scoreClass(r.score)}">${r.score ?? "—"}</span></td>
           </tr>`).join("")}
         </tbody>
       </table>
@@ -1018,6 +1400,7 @@ function viewScreener(){
       RoC = rate of change (price momentum) over the trailing window, computed from each ticker's full available history (up to ${MOCK_DAYS} sessions mock / ~100 live).
       Trend = SMA20 vs. SMA50 crossover relative to price. Momentum score is a heuristic blend of 20d/60d RoC and RSI distance from neutral — a ranking aid, not a formal factor model.
       P/E percentile compares current P/E to an implied historical series (price ÷ assumed-constant EPS) — an approximation until real trailing-EPS history (Alpha Vantage EARNINGS endpoint) is wired in.
+      Score blends valuation (30%), momentum (30%), ROE quality (20%), and revenue growth (20%) into one 0–100 signal — a ranking aid similar to Simply Wall St's Snowflake or Seeking Alpha's Quant Rating, not investment advice.
     </div>
   </div>`;
 }
@@ -1131,7 +1514,8 @@ function renderRefreshModal(){
   const root=document.getElementById("modalRoot");
   if(!state.refreshModalOpen){ if(!state.modalOpen && !state.importModalOpen) root.innerHTML=""; return; }
   const scopeTickers = refreshScopeTickers();
-  const callsNeeded = scopeTickers.length*2 + 1;
+  const perTicker = state.includeExtras ? 4 : 2;
+  const callsNeeded = scopeTickers.length*perTicker + 1;
   const job = state.job && state.job.kind!=="import" ? state.job : null;
   root.innerHTML = `
   <div class="modal-backdrop" id="refreshBackdrop">
@@ -1149,7 +1533,11 @@ function renderRefreshModal(){
               </label>`).join("")}
           </div>
         </div>
-        <div class="warn-box">Alpha Vantage free tier allows 25 requests/day. This scope needs up to ${callsNeeded} calls (2/ticker + 1 shared SPY benchmark pull). Without an API key configured on the server, this regenerates mock data instead of pulling live data — see README.md.</div>
+        <label class="radio-opt ${state.includeExtras?'selected':''}" id="includeExtrasRow" style="display:flex;">
+          <input type="checkbox" id="includeExtrasCheckbox" ${state.includeExtras?'checked':''}>
+          Include dividends + news sentiment (+2 calls/ticker)
+        </label>
+        <div class="warn-box">Alpha Vantage free tier allows 25 requests/day. This scope needs up to ${callsNeeded} calls (${perTicker}/ticker${state.includeExtras?" — 1 price, 1 fundamentals, 1 dividends, 1 news sentiment":""} + 1 shared SPY benchmark pull). Without an API key configured on the server, this regenerates mock data instead of pulling live data — see README.md.</div>
         ${job ? `
         <div>
           <div class="stat-label" style="margin-bottom:8px;">Progress — ${job.completed}/${job.total} · ${job.status}</div>
@@ -1304,6 +1692,39 @@ function drawCharts(){
       });
     }
     renderCorrMatrix(positions.map(p=>p.ticker));
+
+    const totalValue=positions.reduce((a,p)=>a+p.value,0);
+    const weights=getWeights(positions,totalValue);
+    const risk=computeRisk(weights,totalValue);
+    const ctxMc=document.getElementById("chartMonteCarlo");
+    if(ctxMc && risk && totalValue>0){
+      const horizonDays=252, numPaths=300, checkpoints=[21,63,126,189,252];
+      const sig = `${Math.round(totalValue)}|${risk.annReturn.toFixed(4)}|${risk.annVol.toFixed(4)}`;
+      if(!MC_CACHE || MC_CACHE.sig!==sig){
+        MC_CACHE = { sig, fan: monteCarloFanSeries(totalValue, risk.annReturn, risk.annVol, horizonDays, numPaths, checkpoints) };
+      }
+      const fan = MC_CACHE.fan;
+      chartRegistry.mc = new Chart(ctxMc,{
+        type:'line',
+        data:{ labels:fan.map(f=>`${f.day}d`), datasets:[
+          { label:"5th pctl", data:fan.map(f=>f.p05), borderColor:"rgba(220,38,38,0.5)", borderDash:[3,3], pointRadius:0, borderWidth:1 },
+          { label:"25th pctl", data:fan.map(f=>f.p25), borderColor:"rgba(74,127,181,0.6)", pointRadius:0, borderWidth:1 },
+          { label:"Median", data:fan.map(f=>f.p50), borderColor:"#0F4C81", pointRadius:0, borderWidth:2 },
+          { label:"75th pctl", data:fan.map(f=>f.p75), borderColor:"rgba(74,127,181,0.6)", pointRadius:0, borderWidth:1 },
+          { label:"95th pctl", data:fan.map(f=>f.p95), borderColor:"rgba(21,128,61,0.5)", borderDash:[3,3], pointRadius:0, borderWidth:1 },
+        ]},
+        options:{ plugins:{legend:{display:true,labels:{boxWidth:8,font:{size:9}}}}, scales:{ x:{grid:{display:false}}, y:{grid:{color:"#EEF2F7"},ticks:{callback:v=>"$"+Math.round(v/1000)+"k"}} } }
+      });
+      const terminal = fan[fan.length-1];
+      const readout = document.getElementById("mcReadout");
+      if(readout){
+        readout.innerHTML = `
+          <div><div class="stat-label">Median (1yr)</div><div class="stat-value small">${fmtMoney(terminal.p50)}</div></div>
+          <div><div class="stat-label">5th Pctl (1yr)</div><div class="stat-value small" style="color:var(--red);">${fmtMoney(terminal.p05)}</div></div>
+          <div><div class="stat-label">95th Pctl (1yr)</div><div class="stat-value small" style="color:var(--green);">${fmtMoney(terminal.p95)}</div></div>
+        `;
+      }
+    }
   }
   if(state.view==="comparison"){
     const selected=state.comparisonSet;
@@ -1346,7 +1767,7 @@ function renderCorrMatrix(tickers){
 async function startRefresh(){
   const tickers = refreshScopeTickers();
   try{
-    const resp = await fetch("/api/refresh", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ tickers }) });
+    const resp = await fetch("/api/refresh", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ tickers, includeExtras: state.includeExtras }) });
     const json = await resp.json();
     if(!resp.ok){ alert(json.error || "Refresh failed to start."); return; }
     state.job = { id:json.jobId, kind:"refresh", total:json.total, completed:0, log:["Refresh started…"], status:"running" };
@@ -1411,6 +1832,14 @@ function attachHandlers(){
   }));
   document.querySelectorAll("[data-remove]").forEach(el=>el.addEventListener("click",()=>{ delete state.portfolio[el.dataset.remove]; render(); }));
 
+  document.querySelectorAll("[data-target]").forEach(el=>el.addEventListener("change",()=>{
+    const t=el.dataset.target, v=parseFloat(el.value);
+    if(el.value===""||isNaN(v)) delete state.targetWeights[t]; else state.targetWeights[t]=Math.max(0,Math.min(100,v))/100;
+    render();
+  }));
+  const scenarioSelect=document.getElementById("scenarioSelect");
+  if(scenarioSelect) scenarioSelect.addEventListener("change",()=>{ state.stressScenario=scenarioSelect.value; render(); });
+
   const openAddModal=document.getElementById("openAddModal");
   if(openAddModal) openAddModal.addEventListener("click",()=>{ state.modalOpen=true; render(); });
 
@@ -1445,6 +1874,8 @@ function attachHandlers(){
   const refreshClose=document.getElementById("refreshCloseBtn");
   if(refreshClose) refreshClose.addEventListener("click",()=>{ if(!(state.job&&state.job.status==="running")){ state.refreshModalOpen=false; render(); } });
   document.querySelectorAll("[data-scope]").forEach(el=>el.addEventListener("click",()=>{ state.refreshScope=el.dataset.scope; render(); }));
+  const includeExtrasCheckbox=document.getElementById("includeExtrasCheckbox");
+  if(includeExtrasCheckbox) includeExtrasCheckbox.addEventListener("change",()=>{ state.includeExtras=includeExtrasCheckbox.checked; render(); });
   const startBtn=document.getElementById("startRefreshBtn");
   if(startBtn) startBtn.addEventListener("click",startRefresh);
 

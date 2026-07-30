@@ -289,6 +289,54 @@ async function fetchTickerLive(rawInput, data, job) {
   return ticker;
 }
 
+/**
+ * Fetch dividend history for a ticker (Alpha Vantage DIVIDENDS). Stores the
+ * most recent ~12 payments — enough for a trailing-12-month income projection
+ * and a short dividend calendar without bloating data.json.
+ */
+async function fetchDividendsFor(ticker, data, job) {
+  job.log.push(`${ticker}: fetching dividend history…`);
+  const resp = await avRequest({ function: "DIVIDENDS", symbol: ticker });
+  recordCalls(1);
+  await sleep(AV_MIN_SPACING_MS);
+  const raw = Array.isArray(resp.data) ? resp.data : [];
+  const history = raw
+    .map((d) => ({ exDate: d.ex_dividend_date, payDate: d.payment_date || null, amount: num(d.amount) }))
+    .filter((d) => d.exDate && d.amount != null)
+    .sort((a, b) => (a.exDate < b.exDate ? 1 : -1))
+    .slice(0, 12);
+  data.dividends[ticker] = { history, lastRefreshed: new Date().toISOString() };
+  job.log.push(`${ticker}: ${history.length} dividend payment(s) on file`);
+}
+
+/**
+ * Fetch a lightweight news-sentiment summary for a ticker (Alpha Vantage
+ * NEWS_SENTIMENT). Stores only the average relevance-weighted sentiment score,
+ * article count, and the top 5 headlines — not the full raw payload, which can
+ * be large.
+ */
+async function fetchNewsSentimentFor(ticker, data, job) {
+  job.log.push(`${ticker}: fetching news sentiment…`);
+  const resp = await avRequest({ function: "NEWS_SENTIMENT", tickers: ticker, limit: "20" });
+  recordCalls(1);
+  await sleep(AV_MIN_SPACING_MS);
+  const feed = Array.isArray(resp.feed) ? resp.feed : [];
+  let weightedSum = 0, weightSum = 0;
+  const headlines = [];
+  feed.forEach((article) => {
+    const match = (article.ticker_sentiment || []).find((t) => t.ticker === ticker);
+    const score = match ? num(match.ticker_sentiment_score) : num(article.overall_sentiment_score);
+    const relevance = match ? num(match.relevance_score) || 1 : 1;
+    if (score != null) { weightedSum += score * relevance; weightSum += relevance; }
+    if (headlines.length < 5) {
+      headlines.push({ title: article.title, url: article.url, source: article.source, sentiment: score, time: article.time_published || null });
+    }
+  });
+  const avgScore = weightSum > 0 ? weightedSum / weightSum : null;
+  data.newsSentiment[ticker] = { avgScore, articleCount: feed.length, headlines, lastRefreshed: new Date().toISOString() };
+  job.log.push(`${ticker}: ${feed.length} articles, avg sentiment ${avgScore != null ? avgScore.toFixed(3) : "n/a"}`);
+}
+
 function writeTickerIntoData(data, ticker, prices, fundamentals, source) {
   data.prices[ticker] = prices;
   data.universe[ticker] = {
@@ -316,12 +364,13 @@ function newJob(total, kind) {
   };
 }
 
-function startRefreshJob(tickers) {
+function startRefreshJob(tickers, includeExtras) {
   if (currentJob && currentJob.status === "running") {
     throw new Error("A job is already running. Wait for it to finish.");
   }
   const job = newJob(tickers.length, "refresh");
   job.tickers = tickers;
+  job.includeExtras = !!includeExtras;
   currentJob = job;
   runRefreshJob(job).catch((e) => {
     job.status = "error";
@@ -352,7 +401,8 @@ async function runRefreshJob(job) {
   }
 
   const needsBenchmark = !data.prices[BENCH_TICKER];
-  const callsNeeded = job.tickers.length * 2 + (needsBenchmark ? 1 : 0);
+  const perTicker = job.includeExtras ? 4 : 2; // +1 DIVIDENDS +1 NEWS_SENTIMENT when opted in
+  const callsNeeded = job.tickers.length * perTicker + (needsBenchmark ? 1 : 0);
   if (remainingCallsToday() < callsNeeded) {
     job.status = "error";
     job.log.push(`Not enough free-tier calls remaining today (need ~${callsNeeded}, have ${remainingCallsToday()}). Refresh fewer tickers or wait until tomorrow.`);
@@ -382,6 +432,14 @@ async function runRefreshJob(job) {
   for (const t of job.tickers) {
     try {
       await fetchTickerLive(t, data, job);
+      if (job.includeExtras) {
+        if (remainingCallsToday() >= 2) {
+          try { await fetchDividendsFor(t, data, job); } catch (e) { job.log.push(`${t}: dividends FAILED — ${e.message}`); }
+          try { await fetchNewsSentimentFor(t, data, job); } catch (e) { job.log.push(`${t}: news sentiment FAILED — ${e.message}`); }
+        } else {
+          job.log.push(`${t}: skipped dividends/news sentiment — not enough budget remaining today.`);
+        }
+      }
       job.completed++;
       saveDataFile(data); // persist incrementally so partial refreshes aren't lost on error
     } catch (e) {
@@ -502,9 +560,11 @@ function loadDataFile() {
     const d = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
     d.positions = d.positions || {};
     d.fxRates = d.fxRates || { USD: 1 };
+    d.dividends = d.dividends || {};
+    d.newsSentiment = d.newsSentiment || {};
     return d;
   } catch {
-    return { meta: { source: "mock", lastRefreshed: null, benchmarkSource: "mock" }, universe: {}, prices: {}, positions: {}, fxRates: { USD: 1 } };
+    return { meta: { source: "mock", lastRefreshed: null, benchmarkSource: "mock" }, universe: {}, prices: {}, positions: {}, fxRates: { USD: 1 }, dividends: {}, newsSentiment: {} };
   }
 }
 function saveDataFile(data) {
@@ -538,7 +598,7 @@ const server = http.createServer(async (req, res) => {
       ? body.tickers.filter((t) => isKnownTicker(t, data))
       : DEFAULT_TICKERS.slice(0, 8);
     try {
-      const job = startRefreshJob(tickers);
+      const job = startRefreshJob(tickers, !!body.includeExtras);
       return sendJson(res, 200, { jobId: job.id, total: job.total, mockMode: !AV_KEY, remainingCallsToday: remainingCallsToday() });
     } catch (e) {
       return sendJson(res, 409, { error: e.message });

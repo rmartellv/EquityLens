@@ -1,4 +1,4 @@
-# EquityLens (MVP 4 — Portfolio Import + Live Data)
+# EquityLens (MVP 5 — Portfolio Management + Dividends/News)
 
 Equity research & portfolio risk workbench: fundamentals, portfolio risk KPIs (Sharpe, Sortino, beta, VaR/CVaR, correlation, HHI/Effective N), and a technical/valuation screener (momentum, RSI, moving averages, Fibonacci retracement, P/E-vs-own-history) across a 14-name universe (11 single names + SOXX/XLE/GLD ETFs).
 
@@ -34,6 +34,28 @@ Practical budget:
 - **Core 8** tickers ≈ 17 calls — fits in one refresh with room to spare.
 - **Full universe (14)** ≈ 29 calls — exceeds the daily cap in one shot. Refresh in two batches on the same day, or across two days, or trim the "Full universe" scope.
 - Fundamentals (P/E, ROE, revenue growth, etc.) move slowly — you don't need to refresh them as often as prices. A future improvement would be splitting "price-only" vs "full" refresh to cut the per-ticker cost in half.
+- Checking **"Include dividends + news sentiment"** in the Refresh Data modal doubles the per-ticker cost (4 calls instead of 2 — adds `DIVIDENDS` and `NEWS_SENTIMENT`). Core 8 with extras ≈ 33 calls, already over the daily cap — plan on refreshing a smaller scope (e.g. just your actual holdings) when this is checked.
+
+## Portfolio management features (Portfolio & Risk view)
+
+All of the following are pure computation on data already fetched — none of it costs extra API calls:
+
+- **Scenario stress testing** — pick a predefined shock (2008 GFC, 2020 COVID crash, 2022 rate selloff, a plain ±10%/+15% move) and see portfolio-level P&L, propagated through each position's own beta. This is the standard factor-based stress-testing simplification: it overrides the normal covariance assumptions behind parametric VaR with one deterministic market move, and doesn't model idiosyncratic (stock-specific) risk.
+- **Rebalancing / drift tracking** — set an optional target weight per position in the Holdings table; drift (current − target) and a suggested buy/sell dollar amount are computed live. Leaving target blank means no drift tracking for that position.
+- **Risk flags** — automatic concentration (single position or sector over threshold), correlation-cluster (pairs correlating above 0.70), and liquidity (days to exit at 20% of average daily volume) warnings, shown above the Holdings table.
+- **Style box** — a 3×3 size (market cap) × style (P/E-percentile-derived value/growth) grid showing where the portfolio's weight actually sits, same visualization Morningstar's Portfolio X-Ray popularized.
+- **EquityLens Score** — a 0–100 composite per stock blending valuation (30%), momentum (30%), quality/ROE (20%), and revenue growth (20%) percentiles already computed elsewhere in the app. Shown in the Screener and on each Stock Detail page. A ranking aid, not investment advice — see the breakdown bars for what's actually driving the number.
+- **Monte Carlo projection** — a 1-year geometric Brownian motion simulation (300 paths) using the portfolio's own trailing annualized return/volatility as the drift/vol inputs, rendered as a percentile fan chart (5th/25th/median/75th/95th).
+- **Empirical VaR/CVaR** — a historical-simulation complement to the existing parametric VaR/CVaR: sorts the actual trailing 60-day returns and reads the tail directly, no normal-distribution assumption (though noisier with a short window).
+- **Unrealized P&L** — now that cost basis (`avgCost`) is tracked per position (manual entry or Excel import), the Holdings table shows unrealized gain/loss in dollars and percent.
+
+## Dividends & news sentiment (opt-in, +2 API calls/ticker)
+
+Check **"Include dividends + news sentiment"** in the Refresh Data modal to also pull:
+- **Dividend history** (`DIVIDENDS`) — last 12 payments per ticker, shown on Stock Detail. The Portfolio view's **Dividend Income Projection** card sums the trailing-12-month per-share amount × shares held for an estimated annual income and portfolio yield; it falls back to current yield × price for tickers where history hasn't been fetched yet (labeled in the source column).
+- **News sentiment** (`NEWS_SENTIMENT`) — a relevance-weighted average sentiment score (-1 to +1) plus the 5 most recent headlines per ticker, shown on Stock Detail. The Portfolio view's **News Sentiment Snapshot** card summarizes this across current holdings.
+
+Both are additive and gracefully absent until fetched — nothing breaks if you never check the box, you just see "no data yet" placeholders with a pointer to enable it.
 
 ## What's real vs. approximated in live mode
 
@@ -72,6 +94,9 @@ equitylens-app/
 │                           fetchTickerLive() resolves+fetches any ticker (known
 │                           or newly imported), tries OVERVIEW then ETF_PROFILE,
 │                           falls back to SYMBOL_SEARCH for company-name inputs.
+│                           Optional DIVIDENDS + NEWS_SENTIMENT fetch per ticker
+│                           (opt-in, +2 calls/ticker) via fetchDividendsFor()/
+│                           fetchNewsSentimentFor().
 ├── lib/
 │   └── technical-indicators.js   Pure functions: SMA/EMA, RSI, Fibonacci
 │                                  retracement, rate-of-change, trend signal,
@@ -79,13 +104,16 @@ equitylens-app/
 ├── public/
 │   └── index.html          The app: mock data engine (fallback/default) +
 │                            risk-kpis formulas + technical-indicators formulas
-│                            + all 5 views (Dashboard, Stock Detail,
-│                            Portfolio & Risk, Screener, Comparison) + Excel
-│                            portfolio import (SheetJS, client-side parsing)
+│                            + portfolio-management formulas (stress testing,
+│                            rebalancing drift, concentration/correlation/
+│                            liquidity flags, style box, composite score,
+│                            Monte Carlo, empirical VaR/CVaR, dividend income)
+│                            + all 5 views + Excel portfolio import (SheetJS)
 │                            with a dynamic ticker universe (ensureTickerExists)
 ├── data/                   Created at runtime — data.json (cached results,
-│                           now including positions{} and fxRates{}) and
-│                           av-usage.json (daily call counter). Gitignored.
+│                           now including positions{}, fxRates{}, dividends{},
+│                           and newsSentiment{}) and av-usage.json (daily call
+│                           counter). Gitignored.
 ├── .env.example             Copy to .env and add your API key
 └── .gitignore
 ```
@@ -97,8 +125,11 @@ Design principle carried over from the `equitylens-risk-kpis` skill: every formu
 - Parametric VaR/CVaR assume normally distributed returns — understates real tail risk.
 - Alpha Vantage's `TIME_SERIES_DAILY?outputsize=compact` returns ~100 sessions — enough for SMA20/50, RSI14, and a 60-day Fibonacci lookback, but SMA200 will be mostly null. Switching to `outputsize=full` would fix this at the cost of much larger responses and slower parsing — not done here to keep the free-tier call cheap and fast.
 - P/E-vs-history uses a same-EPS approximation (see above) rather than true historical EPS.
-- Factor exposure (Fama-French) and ESG remain stubs — no free reliable data source for either.
+- Factor exposure (Fama-French) and ESG remain stubs — no free reliable data source for either. The Style Box is a DIY substitute (market-cap size × P/E-percentile style), not a real factor regression — see `equitylens-v5-feature-roadmap.md` for the free Ken French data library path to a real one.
 - Debt/Equity and Free Cash Flow aren't pulled live to conserve API calls (see above).
+- Scenario stress testing propagates shocks through beta only — idiosyncratic (stock-specific) risk isn't modeled, standard for factor-based stress testing but worth knowing.
+- Monte Carlo projection uses the portfolio's own trailing annualized return/volatility as GBM inputs — a projection of what the recent regime implies, not a forecast, and short trailing windows (60 sessions) make the vol input noisy.
+- Dividend income projection falls back to current yield × price when real trailing-12-month history hasn't been fetched (`DIVIDENDS` is opt-in) — the Holdings/Income tables label which source is being used per ticker.
 
 ## Next steps (not built yet)
 
