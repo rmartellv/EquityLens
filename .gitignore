@@ -1,0 +1,6 @@
+.DS_Store
+equitylens-app/node_modules/
+equitylens-app/.env
+equitylens-app/data/data.json
+equitylens-app/data/av-usage.json
+*.log
