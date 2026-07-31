@@ -2,6 +2,8 @@
 
 *Technical case study — architecture, design decisions, and what's real vs. simulated. Written for someone reading the code, not a LinkedIn feed.*
 
+**Live:** https://equitylens-n9bz.onrender.com · **Code:** github.com/rmartellv/EquityLens
+
 ## The problem
 
 Equity analysts and portfolio managers work across disconnected tools: a terminal for fundamentals, a spreadsheet for portfolio-level risk (variance, Sharpe, VaR), a separate screener for technicals, and yet another view for peer comparisons. Nothing ties fundamentals, portfolio risk, and technical/valuation screening together in one workspace with a shared data model. Bloomberg and FactSet solve this at a price point ($20-25k/seat/year) that puts them out of reach for the audience who'd benefit most from a lighter version — retail-adjacent investors, students, and analysts who want the workflow without the licensing cost.
@@ -44,15 +46,21 @@ This is disclosed in-app, not hidden — every approximation has a corresponding
 - **Factor exposure (Fama-French) and ESG** — genuine stubs. No reliable free data source for either; the style box (market-cap size × P/E-percentile style tilt) is a deliberate DIY substitute, not a real regression.
 - **Monte Carlo** — a geometric Brownian motion projection using the portfolio's own trailing 60-day annualized return/vol as drift/vol inputs. It's a projection of what the recent regime implies, explicitly not a forecast — the short window makes the vol input noisy, which is disclosed rather than smoothed over.
 
+## Security, since the app is now public
+
+Going from "local-only" to "live URL" changes the threat model — anyone can now reach `/api/refresh` and `/api/import-portfolio`, and there's no authentication. A pre-launch review found a real stored-XSS path: the import endpoint accepted an arbitrary string as a ticker/company name with no validation, wrote it into the shared `data.json`, and the frontend rendered it via `innerHTML` with no escaping anywhere in the codebase — so a malicious "Stock Name" cell in an imported spreadsheet would execute in every subsequent visitor's browser, not just the importer's.
+
+Fixed at the source, not just papered over: any ticker that doesn't match a strict pattern (`[A-Z0-9.\-]{1,6}`) is now rejected and logged rather than stored — whether it's the raw import input or the symbol Alpha Vantage's own `SYMBOL_SEARCH` returns. `market`/`currency`/`purchase date` are stripped of HTML metacharacters and length-capped. On top of that, every name/sector/headline field gets HTML-escaped at render time regardless of source, as a second layer in case a future write path reintroduces the same class of bug. The wildcard CORS header was also removed, since the app has no legitimate cross-origin use case and it was needless extra attack surface on the state-changing endpoints. The public deployment additionally runs with no Alpha Vantage key configured, so it can't be used to drain a personal API quota.
+
 ## What a production version would need
 
 Ranked by where the ratio of "real quant work" to "new infrastructure" is highest:
 
-1. **Live-hosted deployment.** Currently local-only (`node server.js`, `localhost:3300`). Moving `/api/refresh` into a Vercel/Railway serverless function is a small lift given the zero-dependency design — the formula layer doesn't change at all.
-2. **Real historical EPS via `EARNINGS`.** Replaces the same-EPS approximation with true trailing P/E history — the single highest-value data upgrade relative to effort, since the percentile-ranking math is already correct.
-3. **A real factor model.** Ken French's data library (free, CSV, updated monthly) supplies the actual Fama-French factor returns needed to replace the style-box stand-in with a genuine three- or four-factor regression against each holding's return history.
-4. **Historical scenario stress testing beyond beta-propagation.** Currently every shock scenario assumes idiosyncratic risk washes out and only systematic (beta) risk matters — standard for factor-based stress testing, but a real production version would model name-specific tail risk too.
-5. **Bonds and options.** Scoped separately (see `equitylens-bonds-derivatives-plan.md`) — bond valuation (PV/YTM/duration/convexity via the Treasury curve, already available through `TREASURY_YIELD`) is the more tractable next asset class; listed equity options (Black-Scholes, Greeks, implied vol) is the bigger lift, gated on getting a reliable options-chain/IV data source working.
+1. **Real historical EPS via `EARNINGS`.** Replaces the same-EPS approximation with true trailing P/E history — the single highest-value data upgrade relative to effort, since the percentile-ranking math is already correct.
+2. **A real factor model.** Ken French's data library (free, CSV, updated monthly) supplies the actual Fama-French factor returns needed to replace the style-box stand-in with a genuine three- or four-factor regression against each holding's return history.
+3. **Historical scenario stress testing beyond beta-propagation.** Currently every shock scenario assumes idiosyncratic risk washes out and only systematic (beta) risk matters — standard for factor-based stress testing, but a real production version would model name-specific tail risk too.
+4. **Bonds and options.** Scoped separately (see `equitylens-bonds-derivatives-plan.md`) — bond valuation (PV/YTM/duration/convexity via the Treasury curve, already available through `TREASURY_YIELD`) is the more tractable next asset class; listed equity options (Black-Scholes, Greeks, implied vol) is the bigger lift, gated on getting a reliable options-chain/IV data source working.
+5. **Always-on hosting.** Currently free-tier Render, which sleeps after 15 minutes idle (~30s cold start on the next visit) — a $7/mo upgrade removes this once the link is being actively shared with interviewers.
 
 ## Interview talking points
 
@@ -60,4 +68,6 @@ Ranked by where the ratio of "real quant work" to "new infrastructure" is highes
 
 **What was the hardest part?** Staying honest about what's approximated. It would have been easy to fake a factor-exposure number or a smoothed VaR and let it look more finished. Every simplification here is disclosed in the UI itself (footnotes, `src-pill` badges showing live/mock/pending) and in the README's "known limitations" section — because an interviewer who opens the network tab or reads the code will find the gap either way, and disclosing it first is the more credible signal.
 
-**What would you change with more time?** Real EARNINGS-based P/E history first — it's the cheapest true accuracy upgrade left. Then a genuine Fama-French regression, since the data (Ken French's library) is already sitting there unused. Deployment comes before either, though, because a live URL beats a better formula every time an interviewer actually has to decide whether to click.
+**What would you change with more time?** Real EARNINGS-based P/E history first — it's the cheapest true accuracy upgrade left. Then a genuine Fama-French regression, since the data (Ken French's library) is already sitting there unused.
+
+**What happened when you actually deployed it?** Going live surfaced a real stored-XSS vulnerability in the unauthenticated import endpoint — a good example of how a threat model changes the moment "local demo" becomes "public URL." The fix (reject unvalidated tickers at the source, escape at render as a second layer, drop the unnecessary CORS wildcard) is documented in the README's Security notes section and in this case study. Worth naming directly in an interview: finding and fixing that before sharing the link, rather than after someone else found it, is the actual point.

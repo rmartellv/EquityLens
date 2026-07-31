@@ -1,5 +1,7 @@
 # EquityLens (MVP 5 — Portfolio Management + Dividends/News)
 
+**Live demo:** https://equitylens-n9bz.onrender.com (runs in mock mode — no API key configured on the public deployment, see Security notes below). Free-tier hosting spins down after 15 minutes idle; first load after that takes ~30 seconds to wake back up.
+
 Equity research & portfolio risk workbench: fundamentals, portfolio risk KPIs (Sharpe, Sortino, beta, VaR/CVaR, correlation, HHI/Effective N), and a technical/valuation screener (momentum, RSI, moving averages, Fibonacci retracement, P/E-vs-own-history) across a 14-name universe (11 single names + SOXX/XLE/GLD ETFs).
 
 Runs as a tiny local app: a zero-dependency Node server plus a static frontend. Works fully on deterministic mock data out of the box; optionally pulls real data from Alpha Vantage when you add an API key and click **Refresh Data**.
@@ -143,4 +145,4 @@ The app has no authentication — `/api/refresh` and `/api/import-portfolio` are
 ## Next steps (not built yet)
 
 - Wire the `EARNINGS` endpoint for real historical P/E instead of the same-EPS approximation.
-- Deploy target: this local-server architecture is a natural fit for Vercel/Railway serverless functions if/when a publicly hosted version is wanted — the `/api/refresh` logic would move into a serverless function largely unchanged.
+- Upgrade the live deployment to a paid always-on tier (currently free-tier Render, which sleeps after 15 min idle) once this is being actively shared.
