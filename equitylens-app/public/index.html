@@ -97,6 +97,7 @@ td.name-cell{font-family:'Inter',sans-serif;white-space:normal;}
 .src-pill{font-family:'JetBrains Mono',monospace;font-size:9px;padding:2px 6px;border-radius:4px;font-weight:700;letter-spacing:.3px;}
 .src-pill.live{background:rgba(21,128,61,.12);color:var(--green);}
 .src-pill.mock{background:rgba(148,163,184,.18);color:var(--muted);}
+.src-pill.live-price{background:rgba(21,128,61,.07);color:var(--green);opacity:.8;}
 .tag-pill{font-family:'JetBrains Mono',monospace;font-size:10px;padding:3px 8px;border-radius:5px;font-weight:600;}
 .tag-pill.bullish{background:rgba(21,128,61,.12);color:var(--green);}
 .tag-pill.bearish{background:rgba(220,38,38,.12);color:var(--red);}
@@ -876,6 +877,7 @@ let state = {
   targetWeights:{},       // ticker -> target weight (0-1), user-editable; unset = no drift
   stressScenario:"correction",
   includeExtras:false,    // opt-in dividends + news sentiment on refresh (+2 API calls/ticker)
+  refreshMode:"full",     // "full" (price+fundamentals) or "price" (price only, ~half the cost)
 };
 const DIVIDENDS = {};      // ticker -> { history:[{exDate,payDate,amount}], lastRefreshed }
 const NEWS_SENTIMENT = {}; // ticker -> { avgScore, articleCount, headlines:[...], lastRefreshed }
@@ -1514,7 +1516,8 @@ function renderRefreshModal(){
   const root=document.getElementById("modalRoot");
   if(!state.refreshModalOpen){ if(!state.modalOpen && !state.importModalOpen) root.innerHTML=""; return; }
   const scopeTickers = refreshScopeTickers();
-  const perTicker = state.includeExtras ? 4 : 2;
+  const isPriceOnly = state.refreshMode==="price";
+  const perTicker = isPriceOnly ? 1 : (state.includeExtras ? 4 : 2);
   const callsNeeded = scopeTickers.length*perTicker + 1;
   const job = state.job && state.job.kind!=="import" ? state.job : null;
   root.innerHTML = `
@@ -1533,11 +1536,22 @@ function renderRefreshModal(){
               </label>`).join("")}
           </div>
         </div>
-        <label class="radio-opt ${state.includeExtras?'selected':''}" id="includeExtrasRow" style="display:flex;">
-          <input type="checkbox" id="includeExtrasCheckbox" ${state.includeExtras?'checked':''}>
-          Include dividends + news sentiment (+2 calls/ticker)
+        <div>
+          <div class="stat-label" style="margin-bottom:8px;">Refresh mode</div>
+          <div class="radio-row">
+            ${[["full","Full — price + fundamentals (2 calls/ticker)"],["price","Price only (1 call/ticker — ~2x the effective budget)"]].map(([k,label])=>`
+              <label class="radio-opt ${state.refreshMode===k?'selected':''}" data-mode="${k}">
+                <input type="radio" name="mode" value="${k}" ${state.refreshMode===k?'checked':''}>
+                ${label}
+              </label>`).join("")}
+          </div>
+          <div class="footnote" style="margin-top:4px;">Fundamentals (P/E, ROE, revenue growth, etc.) move slowly — price-only refreshes prices and volume without re-pulling them, so tickers already fetched live keep their existing fundamentals. Newly-added or pending tickers stay marked <span class="src-pill live-price">live-price</span> until a full refresh also fetches their fundamentals.</div>
+        </div>
+        <label class="radio-opt ${state.includeExtras?'selected':''} ${isPriceOnly?'disabled':''}" id="includeExtrasRow" style="display:flex; ${isPriceOnly?'opacity:.45;cursor:not-allowed;':''}">
+          <input type="checkbox" id="includeExtrasCheckbox" ${state.includeExtras?'checked':''} ${isPriceOnly?'disabled':''}>
+          Include dividends + news sentiment (+2 calls/ticker)${isPriceOnly?" — requires full mode":""}
         </label>
-        <div class="warn-box">Alpha Vantage free tier allows 25 requests/day. This scope needs up to ${callsNeeded} calls (${perTicker}/ticker${state.includeExtras?" — 1 price, 1 fundamentals, 1 dividends, 1 news sentiment":""} + 1 shared SPY benchmark pull). Without an API key configured on the server, this regenerates mock data instead of pulling live data — see README.md.</div>
+        <div class="warn-box">Alpha Vantage free tier allows 25 requests/day. This scope needs up to ${callsNeeded} calls (${perTicker}/ticker${isPriceOnly?" — price only":state.includeExtras?" — 1 price, 1 fundamentals, 1 dividends, 1 news sentiment":" — 1 price, 1 fundamentals"} + 1 shared SPY benchmark pull). Without an API key configured on the server, this regenerates mock data instead of pulling live data — see README.md.</div>
         ${job ? `
         <div>
           <div class="stat-label" style="margin-bottom:8px;">Progress — ${job.completed}/${job.total} · ${job.status}</div>
@@ -1767,7 +1781,7 @@ function renderCorrMatrix(tickers){
 async function startRefresh(){
   const tickers = refreshScopeTickers();
   try{
-    const resp = await fetch("/api/refresh", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ tickers, includeExtras: state.includeExtras }) });
+    const resp = await fetch("/api/refresh", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ tickers, includeExtras: state.includeExtras, mode: state.refreshMode }) });
     const json = await resp.json();
     if(!resp.ok){ alert(json.error || "Refresh failed to start."); return; }
     state.job = { id:json.jobId, kind:"refresh", total:json.total, completed:0, log:["Refresh started…"], status:"running" };
@@ -1874,6 +1888,7 @@ function attachHandlers(){
   const refreshClose=document.getElementById("refreshCloseBtn");
   if(refreshClose) refreshClose.addEventListener("click",()=>{ if(!(state.job&&state.job.status==="running")){ state.refreshModalOpen=false; render(); } });
   document.querySelectorAll("[data-scope]").forEach(el=>el.addEventListener("click",()=>{ state.refreshScope=el.dataset.scope; render(); }));
+  document.querySelectorAll("[data-mode]").forEach(el=>el.addEventListener("click",()=>{ state.refreshMode=el.dataset.mode; if(state.refreshMode==="price") state.includeExtras=false; render(); }));
   const includeExtrasCheckbox=document.getElementById("includeExtrasCheckbox");
   if(includeExtrasCheckbox) includeExtrasCheckbox.addEventListener("change",()=>{ state.includeExtras=includeExtrasCheckbox.checked; render(); });
   const startBtn=document.getElementById("startRefreshBtn");

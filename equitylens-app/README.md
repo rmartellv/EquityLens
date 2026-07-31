@@ -31,10 +31,10 @@ You control exactly when and how much of your daily quota gets used — nothing 
 Alpha Vantage's free tier is **25 requests/day, 5/minute**. Each ticker refresh costs 2 calls (`TIME_SERIES_DAILY` + `OVERVIEW`), plus 1 shared call for the SPY benchmark (only fetched once, reused across the whole universe until you refresh it again). The server spaces calls ~15 seconds apart to stay under the per-minute limit, and refuses to start a refresh that would exceed today's remaining quota — it'll tell you in the modal instead of silently failing partway through.
 
 Practical budget:
-- **Core 8** tickers ≈ 17 calls — fits in one refresh with room to spare.
-- **Full universe (14)** ≈ 29 calls — exceeds the daily cap in one shot. Refresh in two batches on the same day, or across two days, or trim the "Full universe" scope.
-- Fundamentals (P/E, ROE, revenue growth, etc.) move slowly — you don't need to refresh them as often as prices. A future improvement would be splitting "price-only" vs "full" refresh to cut the per-ticker cost in half.
-- Checking **"Include dividends + news sentiment"** in the Refresh Data modal doubles the per-ticker cost (4 calls instead of 2 — adds `DIVIDENDS` and `NEWS_SENTIMENT`). Core 8 with extras ≈ 33 calls, already over the daily cap — plan on refreshing a smaller scope (e.g. just your actual holdings) when this is checked.
+- **Core 8** tickers ≈ 17 calls (full mode) — fits in one refresh with room to spare.
+- **Full universe (14)** ≈ 29 calls (full mode) — exceeds the daily cap in one shot. Refresh in two batches on the same day, or across two days, or trim the "Full universe" scope.
+- **Refresh mode — Full vs. Price only.** The Refresh Data modal lets you pick between **Full** (`TIME_SERIES_DAILY` + `OVERVIEW`/`ETF_PROFILE`, 2 calls/ticker) and **Price only** (`TIME_SERIES_DAILY` alone, 1 call/ticker). Fundamentals (P/E, ROE, revenue growth, sector, etc.) move slowly and don't need refreshing as often as prices do, so price-only roughly doubles your effective daily budget — the **Full universe (14 tickers)** scope drops from ≈29 calls to ≈15 in price-only mode, fitting inside the 25/day cap in one shot. Price-only refreshes update price, volume, and everything derived from them (risk KPIs, technical indicators, Monte Carlo, etc.) without touching existing fundamentals. A ticker whose fundamentals have never been fetched live shows the `live-price` badge (price is real, fundamentals aren't yet) instead of `live` (both real) — run a **Full** refresh on it at least once to pick up real fundamentals. "Include dividends + news sentiment" requires Full mode (price-only disables it in the modal), since both are additive to a fundamentals-oriented refresh, not a price one.
+- Checking **"Include dividends + news sentiment"** in the Refresh Data modal (Full mode only) doubles the per-ticker cost (4 calls instead of 2 — adds `DIVIDENDS` and `NEWS_SENTIMENT`). Core 8 with extras ≈ 33 calls, already over the daily cap — plan on refreshing a smaller scope (e.g. just your actual holdings) when this is checked.
 
 ## Portfolio management features (Portfolio & Risk view)
 
@@ -133,6 +133,5 @@ Design principle carried over from the `equitylens-risk-kpis` skill: every formu
 
 ## Next steps (not built yet)
 
-- Split refresh into "prices only" (1 call/ticker) vs "full" (2 calls/ticker) to roughly double the effective daily budget.
 - Wire the `EARNINGS` endpoint for real historical P/E instead of the same-EPS approximation.
 - Deploy target: this local-server architecture is a natural fit for Vercel/Railway serverless functions if/when a publicly hosted version is wanted — the `/api/refresh` logic would move into a serverless function largely unchanged.

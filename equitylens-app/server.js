@@ -290,6 +290,41 @@ async function fetchTickerLive(rawInput, data, job) {
 }
 
 /**
+ * Price-only refresh: 1 call/ticker (TIME_SERIES_DAILY) instead of 2, skipping
+ * OVERVIEW/ETF_PROFILE entirely. Roughly doubles the effective daily budget
+ * when only prices (and derived risk/technical metrics) need updating —
+ * fundamentals (P/E, ROE, sector, etc.) move slowly and don't need refreshing
+ * every time. Leaves any existing fundamentals fields untouched; if the
+ * ticker's fundamentals were never fetched live, they stay mock/pending and
+ * the ticker is marked "live-price" (price is real, fundamentals aren't yet)
+ * rather than "live" (both real) — see the src-pill badge in the UI.
+ */
+async function fetchTickerPriceOnly(ticker, data, job) {
+  job.log.push(`${ticker}: fetching daily prices (price-only)…`);
+  const priceResp = await avRequest({ function: "TIME_SERIES_DAILY", symbol: ticker, outputsize: "compact" });
+  recordCalls(1);
+  await sleep(AV_MIN_SPACING_MS);
+  const rawSeries = priceResp["Time Series (Daily)"];
+  if (!rawSeries) throw new Error(`No price series returned for ${ticker} (bad symbol, unsupported exchange, or rate-limited)`);
+  const dates = Object.keys(rawSeries).sort();
+  const prices = dates.map((d) => parseFloat(rawSeries[d]["4. close"]));
+  const volumes = dates.map((d) => parseFloat(rawSeries[d]["5. volume"]));
+  const avgVolumeM = volumes.slice(-10).reduce((a, b) => a + b, 0) / 10 / 1e6;
+
+  data.prices[ticker] = prices;
+  const existing = data.universe[ticker] || {};
+  const fundamentalsAreLive = existing.dataSource === "live";
+  data.universe[ticker] = {
+    ...existing,
+    price: prices[prices.length - 1],
+    avgVolume: avgVolumeM,
+    dataSource: fundamentalsAreLive ? "live" : "live-price",
+    priceLastRefreshed: new Date().toISOString(),
+  };
+  job.log.push(`${ticker}: price-only data written (${prices.length} sessions, fundamentals ${fundamentalsAreLive ? "already live" : `still ${existing.dataSource || "mock"}`})`);
+}
+
+/**
  * Fetch dividend history for a ticker (Alpha Vantage DIVIDENDS). Stores the
  * most recent ~12 payments — enough for a trailing-12-month income projection
  * and a short dividend calendar without bloating data.json.
@@ -364,13 +399,14 @@ function newJob(total, kind) {
   };
 }
 
-function startRefreshJob(tickers, includeExtras) {
+function startRefreshJob(tickers, includeExtras, mode) {
   if (currentJob && currentJob.status === "running") {
     throw new Error("A job is already running. Wait for it to finish.");
   }
   const job = newJob(tickers.length, "refresh");
   job.tickers = tickers;
-  job.includeExtras = !!includeExtras;
+  job.mode = mode === "price" ? "price" : "full";
+  job.includeExtras = job.mode === "price" ? false : !!includeExtras; // extras require a full refresh
   currentJob = job;
   runRefreshJob(job).catch((e) => {
     job.status = "error";
@@ -385,7 +421,7 @@ async function runRefreshJob(job) {
   const useMock = !AV_KEY;
 
   if (useMock) {
-    job.log.push("No ALPHAVANTAGE_API_KEY set — regenerating mock data for the requested tickers.");
+    job.log.push(`No ALPHAVANTAGE_API_KEY set — regenerating mock data for the requested tickers (mode has no cost impact in mock mode).`);
     for (const t of job.tickers) {
       const prices = mockPricesFor(t);
       writeTickerIntoData(data, t, prices, mockFundamentals(t), "mock");
@@ -401,7 +437,9 @@ async function runRefreshJob(job) {
   }
 
   const needsBenchmark = !data.prices[BENCH_TICKER];
-  const perTicker = job.includeExtras ? 4 : 2; // +1 DIVIDENDS +1 NEWS_SENTIMENT when opted in
+  // price-only: 1 call/ticker (TIME_SERIES_DAILY). full: 2 (+ TIME_SERIES_DAILY, OVERVIEW/ETF_PROFILE),
+  // or 4 with dividends+news sentiment opted in.
+  const perTicker = job.mode === "price" ? 1 : (job.includeExtras ? 4 : 2);
   const callsNeeded = job.tickers.length * perTicker + (needsBenchmark ? 1 : 0);
   if (remainingCallsToday() < callsNeeded) {
     job.status = "error";
@@ -431,13 +469,17 @@ async function runRefreshJob(job) {
 
   for (const t of job.tickers) {
     try {
-      await fetchTickerLive(t, data, job);
-      if (job.includeExtras) {
-        if (remainingCallsToday() >= 2) {
-          try { await fetchDividendsFor(t, data, job); } catch (e) { job.log.push(`${t}: dividends FAILED — ${e.message}`); }
-          try { await fetchNewsSentimentFor(t, data, job); } catch (e) { job.log.push(`${t}: news sentiment FAILED — ${e.message}`); }
-        } else {
-          job.log.push(`${t}: skipped dividends/news sentiment — not enough budget remaining today.`);
+      if (job.mode === "price") {
+        await fetchTickerPriceOnly(t, data, job);
+      } else {
+        await fetchTickerLive(t, data, job);
+        if (job.includeExtras) {
+          if (remainingCallsToday() >= 2) {
+            try { await fetchDividendsFor(t, data, job); } catch (e) { job.log.push(`${t}: dividends FAILED — ${e.message}`); }
+            try { await fetchNewsSentimentFor(t, data, job); } catch (e) { job.log.push(`${t}: news sentiment FAILED — ${e.message}`); }
+          } else {
+            job.log.push(`${t}: skipped dividends/news sentiment — not enough budget remaining today.`);
+          }
         }
       }
       job.completed++;
@@ -598,7 +640,7 @@ const server = http.createServer(async (req, res) => {
       ? body.tickers.filter((t) => isKnownTicker(t, data))
       : DEFAULT_TICKERS.slice(0, 8);
     try {
-      const job = startRefreshJob(tickers, !!body.includeExtras);
+      const job = startRefreshJob(tickers, !!body.includeExtras, body.mode);
       return sendJson(res, 200, { jobId: job.id, total: job.total, mockMode: !AV_KEY, remainingCallsToday: remainingCallsToday() });
     } catch (e) {
       return sendJson(res, 409, { error: e.message });
