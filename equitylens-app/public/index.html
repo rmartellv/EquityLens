@@ -647,7 +647,7 @@ function concentrationFlags(positions, weights, opts={}){
   const sectorMap = {};
   positions.forEach(p=>{ const sec=p.sector||"Unknown"; sectorMap[sec]=(sectorMap[sec]||0)+(weights[p.ticker]||0); });
   Object.entries(sectorMap).forEach(([sec,w])=>{
-    if(w >= sectorThreshold) flags.push({ level:"warn", text:`${sec} sector is ${fmtPlain(w)} of the portfolio — above the ${fmtPlain(sectorThreshold,0)} sector threshold.` });
+    if(w >= sectorThreshold) flags.push({ level:"warn", text:`${escapeHtml(sec)} sector is ${fmtPlain(w)} of the portfolio — above the ${fmtPlain(sectorThreshold,0)} sector threshold.` });
   });
   const tickers = positions.map(p=>p.ticker);
   for(let i=0;i<tickers.length;i++){
@@ -840,6 +840,12 @@ recomputeStockStats();
 /* =========================================================================
    FORMATTERS
    ========================================================================= */
+// HTML-escape any string before it goes into an innerHTML template literal.
+// Defense in depth: server.js now rejects/sanitizes unsafe import fields at the
+// source, but names/sectors can also come from Alpha Vantage (external data),
+// so every non-numeric, potentially-external-or-imported string gets escaped
+// at render time too rather than trusting upstream sanitization alone.
+const escapeHtml = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
 const fmtMoney = n => n==null ? "—" : "$"+Math.round(n).toLocaleString();
 const fmtMoneyB = n => n==null ? "—" : "$"+n.toFixed(1)+"B";
 const fmtPct = (n,d=2) => n==null ? "—" : (n>=0?"+":"")+(n*100).toFixed(d)+"%";
@@ -999,7 +1005,7 @@ function viewDashboard(){
           const s=UNIVERSE[t]; const pf=PRICES_FULL[t]; const chg=(pf[pf.length-1]-pf[pf.length-2])/pf[pf.length-2];
           return `<div class="wl-card">
             <div class="wl-top" data-open="${t}">
-              <div><div class="wl-ticker">${t} <span class="src-pill ${s.dataSource}">${s.dataSource}</span></div><div class="wl-name">${s.name}</div></div>
+              <div><div class="wl-ticker">${t} <span class="src-pill ${s.dataSource}">${s.dataSource}</span></div><div class="wl-name">${escapeHtml(s.name)}</div></div>
               <div class="wl-price">${s.price.toFixed(2)}</div>
             </div>
             <div class="wl-metrics">
@@ -1029,12 +1035,12 @@ function viewDetail(ticker){
   return `
   <div class="topbar">
     <div>
-      <div class="page-heading">${ticker} <span style="font-family:'Inter';font-size:14px;color:var(--muted);font-weight:400;">${s.name}</span> <span class="src-pill ${s.dataSource}">${s.dataSource}</span></div>
-      <div class="page-sub">${s.sector||"—"} · ${s.assetClass||"—"}${s.lastRefreshed?` · refreshed ${new Date(s.lastRefreshed).toLocaleString()}`:""}</div>
+      <div class="page-heading">${ticker} <span style="font-family:'Inter';font-size:14px;color:var(--muted);font-weight:400;">${escapeHtml(s.name)}</span> <span class="src-pill ${s.dataSource}">${s.dataSource}</span></div>
+      <div class="page-sub">${escapeHtml(s.sector)||"—"} · ${escapeHtml(s.assetClass)||"—"}${s.lastRefreshed?` · refreshed ${new Date(s.lastRefreshed).toLocaleString()}`:""}</div>
     </div>
     <div class="row" style="display:flex;gap:10px;align-items:center;">
       <select id="detailSelect" class="mono" style="padding:8px 10px;border:1px solid var(--border);border-radius:7px;background:var(--surface);">
-        ${TICKERS.map(t=>`<option value="${t}" ${t===ticker?'selected':''}>${t} — ${UNIVERSE[t].name}</option>`).join("")}
+        ${TICKERS.map(t=>`<option value="${t}" ${t===ticker?'selected':''}>${t} — ${escapeHtml(UNIVERSE[t].name)}</option>`).join("")}
       </select>
       <button class="primary-btn" data-add="${ticker}">${held?"+ Add More Shares":"+ Add to Portfolio"}</button>
     </div>
@@ -1124,7 +1130,7 @@ function viewDetail(ticker){
           const tag = ns.avgScore==null?"neutral":ns.avgScore>=0.15?"bullish":ns.avgScore<=-0.15?"bearish":"neutral";
           return `<div class="table-card" style="padding:16px 18px;">
           <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;"><span class="tag-pill ${tag}" style="font-size:12px;padding:5px 12px;">${ns.avgScore!=null?fmtNum(ns.avgScore,3):"n/a"}</span><span style="font-size:11.5px;color:var(--muted);">${ns.articleCount} articles, relevance-weighted average</span></div>
-          <div style="display:flex;flex-direction:column;gap:8px;">${ns.headlines.map(h=>`<div style="font-size:11.5px;line-height:1.4;"><span style="color:var(--muted);">${h.source||""}</span> — ${h.title}</div>`).join("")}</div>
+          <div style="display:flex;flex-direction:column;gap:8px;">${ns.headlines.map(h=>`<div style="font-size:11.5px;line-height:1.4;"><span style="color:var(--muted);">${escapeHtml(h.source)}</span> — ${escapeHtml(h.title)}</div>`).join("")}</div>
           </div>
           <div class="footnote" style="margin-top:8px;">Refreshed ${ns.lastRefreshed?new Date(ns.lastRefreshed).toLocaleString():"—"}.</div>`;
         })()}
@@ -1140,7 +1146,7 @@ function viewDetail(ticker){
         <div class="stat-card"><div class="stat-label">Revenue Growth</div><div class="stat-value small">${s.revGrowth?fmtPlain(s.revGrowth):"—"}</div><div class="stat-sub">YoY</div></div>
         <div class="stat-card"><div class="stat-label">EBITDA Margin</div><div class="stat-value small">${s.ebitdaMargin?fmtPlain(s.ebitdaMargin):"—"}</div><div class="stat-sub">latest FY</div></div>
         <div class="stat-card"><div class="stat-label">Free Cash Flow</div><div class="stat-value small">${s.fcf?fmtMoneyB(s.fcf):"—"}</div><div class="stat-sub">${s.dataSource==="live"?"needs CASH_FLOW call — not pulled":"TTM (mock)"}</div></div>
-        <div class="stat-card"><div class="stat-label">Avg Daily Volume</div><div class="stat-value small">${fmtNum(s.avgVolume,1)}M</div><div class="stat-sub">${s.assetClass} · ${s.sector||"—"}</div></div>
+        <div class="stat-card"><div class="stat-label">Avg Daily Volume</div><div class="stat-value small">${fmtNum(s.avgVolume,1)}M</div><div class="stat-sub">${escapeHtml(s.assetClass)} · ${escapeHtml(s.sector)||"—"}</div></div>
       </div>
     </div>
     <div class="footnote">Jump to any ticker via the search bar on Dashboard, the selector above, the Screener, or a row in Portfolio &amp; Risk / Comparison. P/E percentile compares current P/E to a ${s.dataSource==="live"?"same-EPS implied historical series (real prices, approximated constant EPS)":"same-EPS implied historical series (mock)"} — see the technical-indicators skill for the real EARNINGS-based upgrade path.</div>
@@ -1218,7 +1224,7 @@ function viewPortfolio(){
               const reb = rebalanceSuggestion(weights[p.ticker], targetPct, totalValue);
               const hasTarget = targetPct!=null;
               return `<tr>
-                <td class="name-cell" data-open="${p.ticker}" style="cursor:pointer;"><span class="ticker-tag">${p.ticker}</span> <span class="src-pill ${p.dataSource}">${p.dataSource}</span><br><span class="co-name">${p.name}</span></td>
+                <td class="name-cell" data-open="${p.ticker}" style="cursor:pointer;"><span class="ticker-tag">${p.ticker}</span> <span class="src-pill ${p.dataSource}">${p.dataSource}</span><br><span class="co-name">${escapeHtml(p.name)}</span></td>
                 <td><span class="sector-pill">${p.market||"US"}</span></td>
                 <td class="num"><div class="stepper"><button data-step="${p.ticker}" data-delta="-10">−</button>${p.shares.toLocaleString()}<button data-step="${p.ticker}" data-delta="10">+</button></div></td>
                 <td class="num">${p.avgCost!=null?p.avgCost.toFixed(2):"—"}${ccyTag}</td>
@@ -1383,7 +1389,7 @@ function viewScreener(){
         <tbody>
         ${rows.map(r=>`
           <tr>
-            <td class="name-cell" data-open="${r.ticker}" style="cursor:pointer;"><span class="ticker-tag">${r.ticker}</span> <span class="src-pill ${r.dataSource}">${r.dataSource}</span><br><span class="co-name">${r.name}</span></td>
+            <td class="name-cell" data-open="${r.ticker}" style="cursor:pointer;"><span class="ticker-tag">${r.ticker}</span> <span class="src-pill ${r.dataSource}">${r.dataSource}</span><br><span class="co-name">${escapeHtml(r.name)}</span></td>
             <td class="num">${fmtNum(r.price,2)}</td>
             <td class="num ${r.roc20!=null?cls(r.roc20):''}">${fmtPct(r.roc20)}</td>
             <td class="num ${r.roc60!=null?cls(r.roc60):''}">${fmtPct(r.roc60)}</td>
@@ -1428,7 +1434,7 @@ function viewComparison(){
           <thead><tr><th>Ticker</th><th class="num">Price</th><th class="num">P/E</th><th class="num">Div Yield</th><th class="num">Debt/Equity</th><th class="num">ROE</th><th class="num">Rev Growth</th><th class="num">EBITDA Margin</th></tr></thead>
           <tbody>
           ${selected.map(t=>{ const s=UNIVERSE[t]; return `<tr>
-            <td class="name-cell" data-open="${t}" style="cursor:pointer;"><span class="ticker-tag">${t}</span> <span class="src-pill ${s.dataSource}">${s.dataSource}</span><br><span class="co-name">${s.name}</span></td>
+            <td class="name-cell" data-open="${t}" style="cursor:pointer;"><span class="ticker-tag">${t}</span> <span class="src-pill ${s.dataSource}">${s.dataSource}</span><br><span class="co-name">${escapeHtml(s.name)}</span></td>
             <td class="num">${s.price.toFixed(2)}</td>
             <td class="num">${fmtNum(s.pe,1)}</td>
             <td class="num">${s.divYield?fmtPlain(s.divYield):"—"}</td>
@@ -1493,7 +1499,7 @@ function renderModal(){
         ${candidates.length===0 ? `<div style="padding:16px;font-size:12px;color:var(--muted);">No matches. All held, or try another search.</div>` : candidates.map(t=>{
           const s=UNIVERSE[t];
           return `<div class="modal-item">
-            <div><div class="modal-item-ticker">${t}</div><div class="modal-item-name">${s.name} · ${s.sector||""}</div></div>
+            <div><div class="modal-item-ticker">${t}</div><div class="modal-item-name">${escapeHtml(s.name)} · ${escapeHtml(s.sector)}</div></div>
             <div style="display:flex;align-items:center;gap:12px;"><span class="modal-item-price">$${s.price.toFixed(2)}</span><button class="modal-add-btn" data-modal-add="${t}">Add</button></div>
           </div>`;
         }).join("")}
@@ -1629,7 +1635,7 @@ function renderImportModal(){
             <table>
               <thead><tr><th>Stock</th><th>Market</th><th class="num">Qty</th><th class="num">Bought Price</th><th>Currency</th></tr></thead>
               <tbody>
-              ${rows.map(r=>`<tr><td>${r.symbol}</td><td>${r.market}</td><td class="num">${r.quantity}</td><td class="num">${r.boughtPrice ?? "—"}</td><td>${r.currency}</td></tr>`).join("")}
+              ${rows.map(r=>`<tr><td>${escapeHtml(r.symbol)}</td><td>${escapeHtml(r.market)}</td><td class="num">${r.quantity}</td><td class="num">${r.boughtPrice ?? "—"}</td><td>${escapeHtml(r.currency)}</td></tr>`).join("")}
               </tbody>
             </table>
           </div>

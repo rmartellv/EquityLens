@@ -120,6 +120,15 @@ equitylens-app/
 
 Design principle carried over from the `equitylens-risk-kpis` skill: every formula (risk and technical) takes plain arrays in, never a ticker string or API call. `index.html` ships with a deterministic mock engine as the default so the app is fully functional with zero setup; `server.js` overlays real data on a per-ticker basis into `data.json`, which the frontend merges on top of the mock defaults. Risk calculations (Sharpe, beta, VaR, correlation, portfolio-level everything) always use a trailing 60-session window across all tickers so mock and live data align index-for-index even when their raw history lengths differ (60 mock days vs. ~100 live days from Alpha Vantage's `compact` output). Technical indicators (SMA, RSI, Fibonacci) use each ticker's full available history instead, since they don't require cross-ticker alignment.
 
+## Security notes
+
+The app has no authentication — `/api/refresh` and `/api/import-portfolio` are open endpoints, which matters once this is deployed to a public URL rather than run locally:
+
+- **Import-field validation.** `runImportJob` (server.js) only ever accepts a symbol as a ticker if it matches `TICKER_PATTERN` (`[A-Z0-9.\-]{1,6}`) — either because the raw input already looked like one, or because it was resolved through Alpha Vantage's `SYMBOL_SEARCH` and the *returned* symbol is itself re-validated against the same pattern. Anything that doesn't validate is rejected and logged, not stored. `market`/`currency`/`purchaseDate` are stripped of HTML metacharacters and length-capped (`stripHtmlChars`, `sanitizeCurrency`, `sanitizeMarket`). This closes a stored-XSS path where an unauthenticated import could otherwise write arbitrary strings into the shared `data.json` and have them execute in other visitors' browsers via `innerHTML`.
+- **Render-time escaping.** `escapeHtml()` (index.html) is applied to every name/sector/headline field that could originate from an import or from Alpha Vantage before it's interpolated into an `innerHTML` template — defense in depth on top of the server-side validation above, in case any other write path is added later.
+- **No CORS wildcard.** `sendJson` no longer sends `Access-Control-Allow-Origin: *`. The frontend is same-origin with the API, so there's no legitimate reason for another website's script to call these endpoints on a visitor's behalf.
+- **Recommended for the public deployment:** don't set `ALPHAVANTAGE_API_KEY` there. Keeping the hosted instance in mock mode means a stranger hitting Refresh/Import can't burn your personal daily quota, and removes any incentive to probe the refresh endpoint at all.
+
 ## Known limitations (worth being upfront about)
 
 - Parametric VaR/CVaR assume normally distributed returns — understates real tail risk.

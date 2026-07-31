@@ -67,6 +67,26 @@ function isKnownTicker(t, data) {
   return DEFAULT_TICKERS.includes(t) || !!(data.universe && data.universe[t]);
 }
 
+/* ---------------- input sanitization (Excel import is untrusted input) ----------------
+ * The import endpoint has no authentication, so any string it accepts can end up stored
+ * in the shared data.json and rendered client-side. Anything that becomes a data.universe
+ * key or a displayed field must be constrained to a safe, narrow charset — HTML-escaping
+ * alone isn't enough for the ticker key itself since it's also used as an object key and
+ * in URL-safe contexts elsewhere, so tickers are validated against TICKER_PATTERN and
+ * rejected outright (not sanitized-and-kept) if they don't match. Free-text fields
+ * (market, purchase date, log messages) are stripped of HTML metacharacters and
+ * length-capped instead, since rejecting them outright isn't necessary. */
+function stripHtmlChars(s, maxLen = 80) {
+  return String(s ?? "").replace(/[<>&"'`]/g, "").slice(0, maxLen).trim();
+}
+function sanitizeCurrency(c) {
+  const v = String(c || "USD").trim().toUpperCase();
+  return /^[A-Z]{3}$/.test(v) ? v : "USD";
+}
+function sanitizeMarket(m) {
+  return stripHtmlChars(m, 20) || "US";
+}
+
 /* ---------------- usage tracking (stay under the daily free-tier cap) ---------------- */
 function todayStr() { return new Date().toISOString().slice(0, 10); }
 function readUsage() {
@@ -250,8 +270,9 @@ async function fetchTickerLive(rawInput, data, job) {
     await sleep(AV_MIN_SPACING_MS);
     const best = (search.bestMatches || [])[0];
     if (!best) throw new Error(`No symbol match found for "${rawInput}"`);
-    ticker = best["1. symbol"];
-    job.log.push(`"${rawInput}" resolved to ${ticker} (${best["2. name"]})`);
+    ticker = String(best["1. symbol"] || "").trim().toUpperCase();
+    if (!TICKER_PATTERN.test(ticker)) throw new Error(`SYMBOL_SEARCH returned an unexpected symbol format for "${rawInput}"`);
+    job.log.push(`"${stripHtmlChars(rawInput, 60)}" resolved to ${ticker} (${stripHtmlChars(best["2. name"], 100)})`);
   }
 
   job.log.push(`${ticker}: fetching daily prices…`);
@@ -524,33 +545,36 @@ async function runImportJob(job) {
   for (const pos of job.positions) {
     const rawSymbol = (pos.symbol || "").trim();
     if (!rawSymbol) { job.log.push("Skipped a row with no stock name/ticker."); job.completed++; continue; }
-    const currency = (pos.currency || "USD").toUpperCase();
+    const currency = sanitizeCurrency(pos.currency);
 
     let resolvedTicker = rawSymbol.toUpperCase();
-    const alreadyKnown = isKnownTicker(resolvedTicker, data) && data.universe[resolvedTicker];
+    // A ticker only ever becomes a data.universe key / rendered field once it matches
+    // TICKER_PATTERN — either because the raw input already looked like one, or because
+    // fetchTickerLive resolved it via SYMBOL_SEARCH (which is itself now validated, see
+    // above). Free-text input that can't be validated is rejected, not stored — this is
+    // the fix for a stored-XSS path where an unauthenticated import could otherwise write
+    // arbitrary strings into the shared data.json and have them rendered via innerHTML.
+    const alreadyKnown = TICKER_PATTERN.test(resolvedTicker) && isKnownTicker(resolvedTicker, data) && data.universe[resolvedTicker];
 
     if (!alreadyKnown) {
-      if (!AV_KEY) {
-        job.log.push(`${rawSymbol}: no ALPHAVANTAGE_API_KEY set — added as pending (no live fetch possible).`);
+      if (!AV_KEY || remainingCallsToday() < 2) {
+        if (!TICKER_PATTERN.test(resolvedTicker)) {
+          job.log.push(`"${stripHtmlChars(rawSymbol, 60)}": doesn't look like a valid ticker and there's no API budget available right now to resolve a company name via SYMBOL_SEARCH — skipped this row. Re-import with a plain ticker symbol (e.g. "AAPL"), or retry once your Alpha Vantage budget resets.`);
+          job.completed++;
+          continue;
+        }
+        job.log.push(`${resolvedTicker}: ${!AV_KEY ? "no ALPHAVANTAGE_API_KEY set" : "not enough free-tier calls remaining today"} — added as pending. Use Refresh Data later to fetch it live.`);
         data.universe[resolvedTicker] = data.universe[resolvedTicker] || {
-          name: rawSymbol, sector: null, assetClass: null, price: pos.boughtPrice || null,
-          dataSource: "pending", lastRefreshed: null,
-        };
-      } else if (remainingCallsToday() < 2) {
-        job.log.push(`${rawSymbol}: not enough free-tier calls remaining today — added as pending. Use Refresh Data later to fetch it live.`);
-        data.universe[resolvedTicker] = data.universe[resolvedTicker] || {
-          name: rawSymbol, sector: null, assetClass: null, price: pos.boughtPrice || null,
+          name: resolvedTicker, sector: null, assetClass: null, price: pos.boughtPrice || null,
           dataSource: "pending", lastRefreshed: null,
         };
       } else {
         try {
           resolvedTicker = await fetchTickerLive(rawSymbol, data, job);
         } catch (e) {
-          job.log.push(`${rawSymbol}: live fetch failed (${e.message}) — added as pending.`);
-          data.universe[resolvedTicker] = data.universe[resolvedTicker] || {
-            name: rawSymbol, sector: null, assetClass: null, price: pos.boughtPrice || null,
-            dataSource: "pending", lastRefreshed: null,
-          };
+          job.log.push(`"${stripHtmlChars(rawSymbol, 60)}": live fetch failed (${e.message}) — skipped this row.`);
+          job.completed++;
+          continue;
         }
       }
     } else {
@@ -576,11 +600,11 @@ async function runImportJob(job) {
     }
 
     data.positions[resolvedTicker] = {
-      quantity: pos.quantity || 0,
-      avgCost: pos.boughtPrice || null,
+      quantity: Number(pos.quantity) || 0,
+      avgCost: Number(pos.boughtPrice) || null,
       currency,
-      market: pos.market || "US",
-      purchaseDate: pos.purchaseDate || null,
+      market: sanitizeMarket(pos.market),
+      purchaseDate: stripHtmlChars(pos.purchaseDate, 40) || null,
     };
 
     job.completed++;
@@ -618,7 +642,10 @@ function saveDataFile(data) {
 const MIME = { ".html": "text/html", ".js": "application/javascript", ".json": "application/json", ".css": "text/css" };
 
 function sendJson(res, code, obj) {
-  res.writeHead(code, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+  // No CORS header: the frontend is served from this same origin and never needs
+  // cross-origin access, so there's no reason to let other websites' scripts call
+  // these endpoints (including the state-changing ones) on a visitor's behalf.
+  res.writeHead(code, { "Content-Type": "application/json" });
   res.end(JSON.stringify(obj));
 }
 
