@@ -1,6 +1,6 @@
-# EquityLens (MVP 6.2 — Valuation Engine + SEC EDGAR Fundamentals + Market Pulse)
+# EquityLens (MVP 6.3 — Valuation Engine + SEC EDGAR Fundamentals + Market Pulse + Real-Data Snapshot)
 
-**Live demo:** https://equitylens-n9bz.onrender.com (runs in mock mode — no API key configured on the public deployment, see Security notes below). Free-tier hosting spins down after 15 minutes idle; first load after that takes ~30 seconds to wake back up.
+**Live demo:** https://equitylens-n9bz.onrender.com (no API key configured on the public deployment, see Security notes below — shows a real, one-time data snapshot rather than live data; see "Real-data snapshot" section below). Free-tier hosting spins down after 15 minutes idle; first load after that takes ~30 seconds to wake back up.
 
 Equity research & portfolio risk workbench: fundamentals, portfolio risk KPIs (Sharpe, Sortino, beta, VaR/CVaR, correlation, HHI/Effective N), a technical/valuation screener (momentum, RSI, moving averages, Fibonacci retracement, P/E-vs-own-history), a full valuation engine (DCF, Trading Multiples, Precedent Transactions, LBO), and a Market Pulse tab (volatility proxy, put/call sentiment, breadth, factor-crowding proxy) across a 14-name universe (11 single names + SOXX/XLE/GLD ETFs).
 
@@ -35,6 +35,27 @@ A dedicated **Market Pulse** tab with four cards, each honestly scoped to what's
 - **Factor Crowding (proxy)** — also computed live, client-side, zero extra cost: average pairwise 60-day return correlation across tracked *equities* (ETFs excluded, since mixing in GLD/XLE would just mechanically dilute the number rather than reflect stock-picking crowding). Bucketed Low/Moderate/High. This is a rough illustrative proxy, not a real positioning metric — genuine crowding analysis needs 13F holdings concentration, short interest, or ETF-flow data, none of which is available free.
 
 **Refresh Data → Refresh Market Pulse** pulls the two live pieces (VIXY + SPY put/call, 2 Alpha Vantage calls total); breadth and crowding update automatically any time ticker data changes, no separate refresh needed. Without an API key, VIXY/put-call regenerate as illustrative mock values, same convention as the rest of the app.
+
+## Real-data snapshot for the public demo (not live data)
+
+The public Render deployment has no API key configured (see Security notes — deliberate, so a stranger can't burn your personal daily quota). Before this feature, that meant it fell back entirely to the synthetic mock engine — obviously-fake numbers, clearly labeled as such but not very compelling for a portfolio piece meant to demonstrate real equity-research chops.
+
+Instead, the public demo now boots from **`data/seed-snapshot.json`** — a real, one-time data pull (Alpha Vantage + SEC EDGAR + Market Pulse) captured once on a machine with real API access, then committed to the repo like any other file (unlike `data/data.json`, which stays gitignored). Every ticker sourced this way is tagged `dataSource: "seeded"`, distinct from both `"live"` and `"mock"` — never presented as a live feed:
+
+- **A visible `seeded` badge** (blue, distinct from `live`'s green and `mock`'s gray) appears everywhere the existing `live`/`mock` badges already appear — Dashboard, Stock Detail, Screener, Comparison — with zero extra wiring needed, since those badges already render `dataSource` directly.
+- **A "not live data" disclosure banner** appears on Dashboard, Stock Detail, Valuation, and Market Pulse — the views most likely to get a close look — stating plainly that this is a frozen snapshot, as of what date, and that running the repo locally with your own keys gets a live feed.
+- **Regenerating the demo's "mock" mode** (someone clicks Refresh Data on the public instance) restores the real seeded figures for any ticker the snapshot covers, rather than overwriting them with synthetic randomness — a ticker outside the seed's 14-name universe still falls back to the synthetic engine as before.
+- **Real SPY benchmark data**, if present in the seed, is used for beta/Sharpe/R² instead of the synthetic SPY-proxy series mock mode otherwise falls back to.
+
+**Regenerating the snapshot** (do this locally, periodically, whenever you want the public demo's numbers to look fresher):
+```bash
+node server.js                    # with a real ALPHAVANTAGE_API_KEY + SEC_EDGAR_CONTACT in .env
+# then in the app: Refresh Data → Full refresh, Pull Fundamentals, Refresh Market Pulse
+node scripts/export-seed.js       # writes data/seed-snapshot.json from your local data/data.json
+git add data/seed-snapshot.json && git commit -m "Update real-data snapshot" && git push
+```
+
+**Privacy, by design:** `scripts/export-seed.js` never copies `data.positions` or `data.fxRates` — those hold your personal portfolio (share counts, cost basis, purchase dates) if you've ever used Import Portfolio locally, and have no business in a public repo. Only market/company data goes into the seed (prices, fundamentals, dividends, news sentiment, market pulse) — all of it already public information sourced from Alpha Vantage and SEC EDGAR, so there's no confidentiality concern with committing it, only the personal-holdings exclusion above.
 
 Runs as a tiny local app: a zero-dependency Node server plus a static frontend. Works fully on deterministic mock data out of the box; optionally pulls real data from Alpha Vantage when you add an API key and click **Refresh Data**.
 
@@ -135,6 +156,19 @@ equitylens-app/
 │                           fetchNewsSentimentFor(). runFundamentalsJob() drives
 │                           the SEC EDGAR pull via lib/edgar.js. runMarketPulseJob()
 │                           drives the VIXY/put-call pull, stored as data.marketPulse.
+│                           SEED (loaded once at startup from data/seed-snapshot.json,
+│                           if present) is used as the fallback dataset — instead of
+│                           the fully synthetic mock engine — anywhere no
+│                           ALPHAVANTAGE_API_KEY is configured: loadDataFile()'s
+│                           first-run bootstrap, runRefreshJob()'s mock branch, and
+│                           runMarketPulseJob()'s mock branch. Always tagged
+│                           dataSource "seeded", never "live" — see "Real-data
+│                           snapshot" section above.
+├── scripts/
+│   └── export-seed.js      Run locally after a real refresh to build
+│                            data/seed-snapshot.json from data/data.json — strips
+│                            personal data (positions, fxRates), keeps only public
+│                            market/company data. See "Real-data snapshot" above.
 ├── lib/
 │   ├── technical-indicators.js   Pure functions: SMA/EMA, RSI, Fibonacci
 │   │                              retracement, rate-of-change, trend signal,
@@ -157,10 +191,14 @@ equitylens-app/
 │                            computeCrowdingProxy — pure, zero-API-cost)
 │                            + all 7 views + Excel portfolio import (SheetJS)
 │                            with a dynamic ticker universe (ensureTickerExists)
-├── data/                   Created at runtime — data.json (cached results,
-│                           now including positions{}, fxRates{}, dividends{},
-│                           newsSentiment{}, and marketPulse{}) and
-│                           av-usage.json (daily call counter). Gitignored.
+├── data/
+│   ├── data.json           Created at runtime — cached results (positions{},
+│   │                        fxRates{}, dividends{}, newsSentiment{}, marketPulse{}).
+│   │                        Gitignored — holds your real working state.
+│   ├── av-usage.json       Created at runtime — daily call counter. Gitignored.
+│   └── seed-snapshot.json  Committed (NOT gitignored) — the real-data snapshot
+│                            described above. Public info only, positions/fxRates
+│                            deliberately excluded by scripts/export-seed.js.
 ├── .env.example             Copy to .env and add your API key
 └── .gitignore
 ```
@@ -179,7 +217,8 @@ The app has no authentication — `/api/refresh`, `/api/import-portfolio`, `/api
 - **Sanitized User-Agent.** Node's `http` module throws on any header value containing a byte outside printable ASCII — a real bug caught during testing, where the fallback User-Agent's em dash crashed every request. Both the fallback and any custom `SEC_EDGAR_CONTACT` value are stripped to safe printable ASCII before use, so a stray accented character or smart quote in your contact string degrades gracefully instead of breaking the feature.
 - **Contact info stays out of committed source.** `SEC_EDGAR_CONTACT` lives in the gitignored `.env` (see `.env.example`), never hardcoded — same handling as `ALPHAVANTAGE_API_KEY`, deliberate since this repo has a public live deployment.
 - **Good-citizen rate limiting toward a shared public resource.** SEC's documented cap is 10 req/sec across all EDGAR domains; requests here are spaced at 5 req/sec (`MIN_SPACING_MS`), and the ~1MB ticker→CIK lookup file is cached locally and only re-fetched at most weekly rather than on every refresh click.
-- **Recommended for the public deployment:** don't set `ALPHAVANTAGE_API_KEY` there. Keeping the hosted instance in mock mode means a stranger hitting Refresh/Import can't burn your personal daily quota, and removes any incentive to probe the refresh endpoints at all. `SEC_EDGAR_CONTACT` has no comparable abuse cost (no quota to burn), but leaving it unset on a public deployment means visitors triggering Pull Fundamentals would do so under a generic, non-identifying User-Agent — fine functionally, just worth knowing.
+- **Recommended for the public deployment:** don't set `ALPHAVANTAGE_API_KEY` there. Keeping the hosted instance keyless means a stranger hitting Refresh/Import can't burn your personal daily quota, and removes any incentive to probe the refresh endpoints at all — it now falls back to the committed real-data snapshot instead (see "Real-data snapshot" above), not your live quota. `SEC_EDGAR_CONTACT` has no comparable abuse cost (no quota to burn), but leaving it unset on a public deployment means visitors triggering Pull Fundamentals would do so under a generic, non-identifying User-Agent — fine functionally, just worth knowing.
+- **`data/seed-snapshot.json` contains no secrets and nothing personal** — it's deliberately built by `scripts/export-seed.js` to exclude `data.positions`/`data.fxRates` (your personal portfolio, if you've ever used Import Portfolio locally), keeping only public market/company data (prices, fundamentals, dividends, news sentiment, market pulse) already sourced from Alpha Vantage/SEC EDGAR. Safe to commit to a public repo, same reasoning as everything else here being either public data or explicitly gitignored.
 
 ## Known limitations (worth being upfront about)
 
@@ -195,6 +234,7 @@ The app has no authentication — `/api/refresh`, `/api/import-portfolio`, `/api
 - **Market Pulse's VIXY volatility card is a proxy, not the real VIX index** — Alpha Vantage has no direct spot-VIX symbol, so VIXY (VIX futures ETF) stands in; its absolute price level does not equal "the VIX," only its trend/direction is a fair read.
 - **Market Pulse's breadth is scoped to this app's own tracked universe (up to 14 tickers), not the real market** — there's no free data source for a true NYSE/Nasdaq advance-decline line, so this reads "9 of 14 tracked names in an uptrend," not "68% of the NYSE is advancing."
 - **Market Pulse's factor-crowding card is a correlation-based illustrative proxy, not a real positioning metric** — genuine crowding analysis needs 13F holdings concentration, short interest, or ETF-flow data, none of which is available free; average pairwise return correlation across tracked equities is directionally informative at best.
+- **The public demo's "seeded" data is frozen, not live** — by design (see "Real-data snapshot" above), but worth restating here: prices, fundamentals, and Market Pulse readings on the public deployment reflect whatever date `scripts/export-seed.js` was last run, not today. The banner and `seeded` badge disclose this in-app; re-run the export script periodically if the staleness starts to look odd.
 
 ## Next steps (not built yet)
 
@@ -203,3 +243,4 @@ The app has no authentication — `/api/refresh`, `/api/import-portfolio`, `/api
 - Expand `lib/edgar.js`'s tag-alias lists as real filers turn up coverage gaps (see the limitation above) — the extraction code doesn't need to change, only the alias arrays.
 - DCF/LBO still run off FCF even for tickers with real EBITDA now available (only the Trading Multiples panel upgrades to a true EV/EBITDA basis) — extending DCF/LBO to optionally use real EBITDA-derived cash flow is a reasonable next pass.
 - If a real broad-market breadth feed (advance/decline) or a genuine positioning/crowding data source ever becomes available on a free tier, both Market Pulse cards (breadth, crowding) are built to swap in — the client-side calc functions (`computeMarketBreadth`, `computeCrowdingProxy`) are the only things that would change, same "formulas are data-source agnostic" principle as the risk-kpis/technical-indicators skills.
+- Automate `scripts/export-seed.js` on a schedule (e.g. a monthly local cron or GitHub Action with secrets configured) so the public demo's snapshot doesn't require a manual re-run + push to stay reasonably current.

@@ -32,7 +32,30 @@ const DATA_DIR = path.join(ROOT, "data");
 const DATA_FILE = path.join(DATA_DIR, "data.json");
 const USAGE_FILE = path.join(DATA_DIR, "av-usage.json");
 const EDGAR_CACHE_FILE = path.join(DATA_DIR, "edgar-ticker-cik.json");
+const SEED_FILE = path.join(DATA_DIR, "seed-snapshot.json");
 const ENV_FILE = path.join(ROOT, ".env");
+
+/**
+ * SEED — a real, one-time data pull (Alpha Vantage + SEC EDGAR + Market
+ * Pulse) captured on a machine with real API access, committed to the repo
+ * (unlike data.json, data/seed-snapshot.json is NOT gitignored — see
+ * scripts/export-seed.js). This exists so the public, keyless Render
+ * deployment can show real company financials instead of the fully
+ * synthetic mock engine below, without ever calling a live API itself.
+ *
+ * IMPORTANT — this is frozen data, not a live feed. Every place SEED gets
+ * used tags dataSource as "seeded" (never "live") specifically so the UI
+ * can disclose it honestly — see the ".src-pill.seeded" badge and the
+ * "not live data" banner in public/index.html. Only used as a fallback when
+ * no ALPHAVANTAGE_API_KEY is configured; a real key + a real refresh always
+ * takes priority.
+ */
+let SEED = null;
+try {
+  SEED = JSON.parse(fs.readFileSync(SEED_FILE, "utf8"));
+} catch {
+  SEED = null; // no seed committed, or unreadable — falls back to synthetic mock, as before
+}
 
 const AV_DAILY_CAP = 25;         // Alpha Vantage free-tier daily request cap
 const AV_MIN_SPACING_MS = 15000; // stay under 5 calls/minute
@@ -400,14 +423,17 @@ async function fetchNewsSentimentFor(ticker, data, job) {
   job.log.push(`${ticker}: ${feed.length} articles, avg sentiment ${avgScore != null ? avgScore.toFixed(3) : "n/a"}`);
 }
 
-function writeTickerIntoData(data, ticker, prices, fundamentals, source) {
+// lastRefreshedOverride lets seeded writes preserve the snapshot's real
+// original timestamp instead of stamping "just now" — the whole point of
+// disclosing seeded data honestly is that "as of" date staying truthful.
+function writeTickerIntoData(data, ticker, prices, fundamentals, source, lastRefreshedOverride) {
   data.prices[ticker] = prices;
   data.universe[ticker] = {
     ...(data.universe[ticker] || {}),
     ...fundamentals,
     price: prices[prices.length - 1],
     dataSource: source,
-    lastRefreshed: new Date().toISOString(),
+    lastRefreshed: lastRefreshedOverride || new Date().toISOString(),
   };
 }
 
@@ -449,14 +475,33 @@ async function runRefreshJob(job) {
   const useMock = !AV_KEY;
 
   if (useMock) {
-    job.log.push(`No ALPHAVANTAGE_API_KEY set — regenerating mock data for the requested tickers (mode has no cost impact in mock mode).`);
+    job.log.push(SEED
+      ? `No ALPHAVANTAGE_API_KEY set — using the committed real-data snapshot (as of ${SEED.snapshotDate}) for tickers it covers, falling back to synthetic mock data for anything outside it.`
+      : `No ALPHAVANTAGE_API_KEY set — regenerating mock data for the requested tickers (mode has no cost impact in mock mode).`);
     for (const t of job.tickers) {
-      const prices = mockPricesFor(t);
-      writeTickerIntoData(data, t, prices, mockFundamentals(t), "mock");
-      job.completed++;
-      job.log.push(`${t}: mock data regenerated`);
+      const seededEntry = SEED && SEED.universe && SEED.universe[t];
+      if (seededEntry) {
+        const prices = (SEED.prices && SEED.prices[t]) || mockPricesFor(t);
+        writeTickerIntoData(data, t, prices, seededEntry, "seeded", seededEntry.lastRefreshed);
+        if (SEED.dividends && SEED.dividends[t]) data.dividends[t] = SEED.dividends[t];
+        if (SEED.newsSentiment && SEED.newsSentiment[t]) data.newsSentiment[t] = SEED.newsSentiment[t];
+        job.completed++;
+        job.log.push(`${t}: real-data snapshot restored (as of ${seededEntry.lastRefreshed || SEED.snapshotDate}) — not live, see the "seeded" badge.`);
+      } else {
+        const prices = mockPricesFor(t);
+        writeTickerIntoData(data, t, prices, mockFundamentals(t), "mock");
+        job.completed++;
+        job.log.push(`${t}: mock data regenerated`);
+      }
     }
-    data.meta.source = "mock";
+    if (SEED && SEED.prices && SEED.prices.SPY && !data.prices.SPY) {
+      data.prices.SPY = SEED.prices.SPY;
+      data.meta.benchmarkSource = "seeded";
+    }
+    const anySeeded = Object.values(data.universe).some((u) => u.dataSource === "seeded");
+    const anyMockNow = Object.values(data.universe).some((u) => u.dataSource === "mock");
+    data.meta.source = anySeeded && anyMockNow ? "mixed" : anySeeded ? "seeded" : "mock";
+    data.meta.seededAt = SEED ? SEED.snapshotDate : null;
     data.meta.lastRefreshed = new Date().toISOString();
     saveDataFile(data);
     job.status = "done";
@@ -520,7 +565,8 @@ async function runRefreshJob(job) {
   data.meta.lastRefreshed = new Date().toISOString();
   const anyLive = Object.values(data.universe).some((u) => u.dataSource === "live");
   const anyMock = Object.values(data.universe).some((u) => u.dataSource === "mock");
-  data.meta.source = anyLive && anyMock ? "mixed" : anyLive ? "live" : "mock";
+  const anySeeded = Object.values(data.universe).some((u) => u.dataSource === "seeded");
+  data.meta.source = anyLive ? (anyMock || anySeeded ? "mixed" : "live") : anySeeded ? (anyMock ? "mixed" : "seeded") : "mock";
   saveDataFile(data);
   job.status = "done";
   job.finishedAt = new Date().toISOString();
@@ -621,7 +667,8 @@ async function runImportJob(job) {
   data.meta.lastRefreshed = new Date().toISOString();
   const anyLive = Object.values(data.universe).some((u) => u.dataSource === "live");
   const anyMock = Object.values(data.universe).some((u) => u.dataSource === "mock");
-  data.meta.source = anyLive && anyMock ? "mixed" : anyLive ? "live" : "mock";
+  const anySeeded = Object.values(data.universe).some((u) => u.dataSource === "seeded");
+  data.meta.source = anyLive ? (anyMock || anySeeded ? "mixed" : "live") : anySeeded ? (anyMock ? "mixed" : "seeded") : "mock";
   saveDataFile(data);
   job.status = "done";
   job.finishedAt = new Date().toISOString();
@@ -776,8 +823,18 @@ async function runMarketPulseJob(job) {
   data.marketPulse = data.marketPulse || {};
 
   if (!AV_KEY) {
+    if (SEED && SEED.marketPulse) {
+      job.log.push(`No ALPHAVANTAGE_API_KEY set — using the committed real-data snapshot for Market Pulse (as of ${SEED.marketPulse.lastRefreshed || SEED.snapshotDate}), not a live pull.`);
+      data.marketPulse = { ...SEED.marketPulse, dataSource: "seeded" };
+      job.completed = 2;
+      saveDataFile(data);
+      job.status = "done";
+      job.finishedAt = new Date().toISOString();
+      return;
+    }
     // Deterministic mock, same convention as mockPricesFor for tickers —
-    // never a live-looking number when there's no key configured.
+    // never a live-looking number when there's no key configured and no
+    // seed is available either.
     const series = Array.from({ length: 60 }, (_, i) => 18 + Math.sin(i / 5) * 4);
     job.log.push("No ALPHAVANTAGE_API_KEY set — using illustrative mock VIXY series and put/call ratio.");
     data.marketPulse = {
@@ -864,6 +921,22 @@ function loadDataFile() {
     d.marketPulse = d.marketPulse || null;
     return d;
   } catch {
+    // First run ever (no data.json on disk yet, e.g. a fresh Render deploy).
+    // If there's no live API key but a committed seed exists, bootstrap
+    // straight from it — so a first-time visitor sees real (frozen) data
+    // immediately, without needing to click Refresh Data first.
+    if (!AV_KEY && SEED) {
+      return {
+        meta: { source: "seeded", lastRefreshed: null, benchmarkSource: SEED.prices && SEED.prices.SPY ? "seeded" : "mock", seededAt: SEED.snapshotDate },
+        universe: { ...(SEED.universe || {}) },
+        prices: { ...(SEED.prices || {}) },
+        positions: {},
+        fxRates: { USD: 1 },
+        dividends: { ...(SEED.dividends || {}) },
+        newsSentiment: { ...(SEED.newsSentiment || {}) },
+        marketPulse: SEED.marketPulse ? { ...SEED.marketPulse } : null,
+      };
+    }
     return { meta: { source: "mock", lastRefreshed: null, benchmarkSource: "mock" }, universe: {}, prices: {}, positions: {}, fxRates: { USD: 1 }, dividends: {}, newsSentiment: {}, marketPulse: null };
   }
 }
@@ -979,4 +1052,9 @@ server.listen(PORT, () => {
   console.log(AV_KEY ? "Alpha Vantage key detected — live refresh enabled." : "No ALPHAVANTAGE_API_KEY set — Refresh Data will regenerate mock data. See README.md.");
   console.log(`Free-tier calls remaining today: ${remainingCallsToday()}/${AV_DAILY_CAP}`);
   console.log(SEC_EDGAR_CONTACT ? "SEC EDGAR contact configured — Pull Fundamentals enabled." : "No SEC_EDGAR_CONTACT set — Pull Fundamentals will still work but sends a generic User-Agent. Set it in .env (see .env.example).");
+  if (!AV_KEY) {
+    console.log(SEED
+      ? `Real-data snapshot loaded (as of ${SEED.snapshotDate}, ${Object.keys(SEED.universe || {}).length} tickers) — used as the fallback dataset since no ALPHAVANTAGE_API_KEY is set. This is frozen data, not live; see data/seed-snapshot.json and the "seeded" badge in the app.`
+      : "No data/seed-snapshot.json found — falling back to fully synthetic mock data when no API key is configured. Run scripts/export-seed.js after a real refresh to change that.");
+  }
 });

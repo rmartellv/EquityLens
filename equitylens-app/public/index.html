@@ -98,6 +98,7 @@ td.name-cell{font-family:'Inter',sans-serif;white-space:normal;}
 .src-pill.live{background:rgba(21,128,61,.12);color:var(--green);}
 .src-pill.mock{background:rgba(148,163,184,.18);color:var(--muted);}
 .src-pill.live-price{background:rgba(21,128,61,.07);color:var(--green);opacity:.8;}
+.src-pill.seeded{background:rgba(15,76,129,.10);color:var(--accent);}
 .tag-pill{font-family:'JetBrains Mono',monospace;font-size:10px;padding:3px 8px;border-radius:5px;font-weight:600;}
 .tag-pill.bullish{background:rgba(21,128,61,.12);color:var(--green);}
 .tag-pill.bearish{background:rgba(220,38,38,.12);color:var(--red);}
@@ -140,6 +141,7 @@ tbody tr:hover{background:#FAFBFD;}
 .progress-fill{height:100%;background:var(--accent);transition:width .3s;}
 .job-log{background:var(--surface-2);border-radius:8px;padding:10px 12px;font-family:'JetBrains Mono',monospace;font-size:10.5px;color:var(--muted);max-height:140px;overflow-y:auto;display:flex;flex-direction:column;gap:3px;}
 .warn-box{background:rgba(180,83,9,.08);border:1px solid rgba(180,83,9,.25);color:var(--amber);border-radius:8px;padding:10px 12px;font-size:11.5px;line-height:1.5;}
+.info-box{background:rgba(15,76,129,.06);border:1px solid rgba(15,76,129,.22);color:var(--accent);border-radius:8px;padding:10px 12px;font-size:11.5px;line-height:1.5;}
 .flag-row{display:flex;flex-direction:column;gap:6px;}
 .flag{border-radius:8px;padding:9px 12px;font-size:11.5px;line-height:1.5;}
 .flag-warn{background:rgba(180,83,9,.08);border:1px solid rgba(180,83,9,.25);color:var(--amber);}
@@ -1085,6 +1087,17 @@ function setVAField(t, path, value){
 // so every non-numeric, potentially-external-or-imported string gets escaped
 // at render time too rather than trusting upstream sanitization alone.
 const escapeHtml = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
+// Shown once, prominently, wherever a visitor is likely to first notice — not
+// on every single view (the per-ticker "seeded" src-pill badge already
+// discloses this consistently everywhere else). dataMeta.source is "seeded"
+// (public/keyless deployment bootstrapped straight from the committed
+// snapshot) or "mixed" (some tickers seeded, some regenerated as synthetic
+// mock, e.g. a ticker outside the seed's default universe).
+function seededDisclosureBanner(){
+  if(dataMeta.source!=="seeded" && dataMeta.source!=="mixed") return "";
+  const asOf = dataMeta.seededAt ? new Date(dataMeta.seededAt).toLocaleDateString(undefined,{year:"numeric",month:"short",day:"numeric"}) : "an earlier date";
+  return `<div class="info-box" style="margin-bottom:14px;">This public demo doesn't call live APIs. Tickers marked <span class="src-pill seeded">seeded</span> show a real one-time data pull (Alpha Vantage + SEC EDGAR), frozen as of ${escapeHtml(asOf)} — <b>not live data</b>. Clone the repo and run it with your own API keys (see README) for a live feed.</div>`;
+}
 const fmtMoney = n => n==null ? "—" : "$"+Math.round(n).toLocaleString();
 const fmtMoneyB = n => n==null ? "—" : "$"+n.toFixed(1)+"B";
 const fmtPct = (n,d=2) => n==null ? "—" : (n>=0?"+":"")+(n*100).toFixed(d)+"%";
@@ -1232,12 +1245,13 @@ function viewDashboard(){
     <div class="page-title">Research workbench — portfolio, technicals &amp; peer analysis</div>
   </div>
   <div class="content">
+    ${seededDisclosureBanner()}
     <div>
       <div class="section-label">Portfolio Summary</div>
       <div class="summary-grid summary-grid-6">
         <div class="stat-card hero"><div class="stat-label">Total Value</div><div class="stat-value">${fmtMoney(totalValue)}</div><div class="stat-sub ${cls(dayChangeVal)}">${arrow(dayChangeVal)} ${fmtMoney(Math.abs(dayChangeVal))} (${fmtPct(dayChangePct)}) today</div></div>
         <div class="stat-card"><div class="stat-label">Sharpe Ratio</div><div class="stat-value">${risk?fmtNum(risk.sharpe):"—"}</div><div class="stat-sub">rf = 3M T-bill (${fmtPlain(RF,1)})</div></div>
-        <div class="stat-card"><div class="stat-label">Beta vs. ${dataMeta.benchmarkSource==="live"?"SPY":"SPY-proxy"}</div><div class="stat-value">${risk?fmtNum(risk.beta):"—"}</div><div class="stat-sub">R² ${risk?fmtNum(risk.rsq):"—"}</div></div>
+        <div class="stat-card"><div class="stat-label">Beta vs. ${dataMeta.benchmarkSource==="live"?"SPY":dataMeta.benchmarkSource==="seeded"?"SPY (snapshot)":"SPY-proxy"}</div><div class="stat-value">${risk?fmtNum(risk.beta):"—"}</div><div class="stat-sub">R² ${risk?fmtNum(risk.rsq):"—"}</div></div>
         <div class="stat-card"><div class="stat-label">Ann. Volatility</div><div class="stat-value">${risk?fmtPlain(risk.annVol):"—"}</div><div class="stat-sub">σ portfolio</div></div>
         <div class="stat-card"><div class="stat-label">95% VaR (1-day)</div><div class="stat-value" style="color:var(--red);">${risk?"-"+fmtMoney(risk.var1d.value):"—"}</div><div class="stat-sub">${risk?"-"+fmtPlain(risk.var1d.pct)+" of NAV":""}</div></div>
         <div class="stat-card"><div class="stat-label">Positions</div><div class="stat-value">${positions.length}</div><div class="stat-sub">Effective N ${risk?fmtNum(risk.effN,1):"—"}</div></div>
@@ -1262,7 +1276,7 @@ function viewDashboard(){
         }).join("")}
       </div>
     </div>
-    <div class="footnote">Mock tickers use a deterministic ${MOCK_DAYS}-day layered factor model (market → sector → stock); refreshed tickers show real Alpha Vantage data. Risk metrics (Sharpe/beta/VaR/etc.) use the trailing ${RISK_WINDOW}-session window across all tickers for consistency. Rf = 4.3% (3-month T-bill baseline).</div>
+    <div class="footnote">Mock tickers use a deterministic ${MOCK_DAYS}-day layered factor model (market → sector → stock); seeded tickers show a real one-time Alpha Vantage + SEC EDGAR pull, frozen at whatever date it was captured (not live); refreshed tickers show real, current Alpha Vantage data. Risk metrics (Sharpe/beta/VaR/etc.) use the trailing ${RISK_WINDOW}-session window across all tickers for consistency. Rf = 4.3% (3-month T-bill baseline).</div>
   </div>`;
 }
 
@@ -1281,7 +1295,7 @@ function viewDetail(ticker){
   <div class="topbar">
     <div>
       <div class="page-heading">${ticker} <span style="font-family:'Inter';font-size:14px;color:var(--muted);font-weight:400;">${escapeHtml(s.name)}</span> <span class="src-pill ${s.dataSource}">${s.dataSource}</span></div>
-      <div class="page-sub">${escapeHtml(s.sector)||"—"} · ${escapeHtml(s.assetClass)||"—"}${s.lastRefreshed?` · refreshed ${new Date(s.lastRefreshed).toLocaleString()}`:""}</div>
+      <div class="page-sub">${escapeHtml(s.sector)||"—"} · ${escapeHtml(s.assetClass)||"—"}${s.lastRefreshed?` · ${s.dataSource==='seeded'?'snapshot as of':'refreshed'} ${new Date(s.lastRefreshed).toLocaleString()}`:""}</div>
     </div>
     <div class="row" style="display:flex;gap:10px;align-items:center;">
       <select id="detailSelect" class="mono" style="padding:8px 10px;border:1px solid var(--border);border-radius:7px;background:var(--surface);">
@@ -1291,6 +1305,7 @@ function viewDetail(ticker){
     </div>
   </div>
   <div class="content">
+    ${seededDisclosureBanner()}
     <div class="detail-grid">
       <div class="table-card" style="padding:20px;">
         <div class="section-label">Price + SMA20/SMA50 + Fibonacci retracement (${Math.min(60,pf.length)}d lookback)</div>
@@ -1386,11 +1401,11 @@ function viewDetail(ticker){
       <div class="summary-grid summary-grid-4">
         <div class="stat-card"><div class="stat-label">P/E</div><div class="stat-value small">${fmtNum(s.pe,1)}</div><div class="stat-sub">${s.dataSource==="live"?"live (OVERVIEW)":"trailing (mock)"}</div></div>
         <div class="stat-card"><div class="stat-label">Div. Yield</div><div class="stat-value small">${s.divYield?fmtPlain(s.divYield):"—"}</div><div class="stat-sub">${s.expRatio?`exp. ratio ${(s.expRatio*100).toFixed(2)}%`:"annual"}</div></div>
-        <div class="stat-card"><div class="stat-label">Debt/Equity</div><div class="stat-value small">${s.debtEquity ?? "—"}</div><div class="stat-sub">${s.dataSource==="live"?"needs BALANCE_SHEET call — not pulled":"latest FY (mock)"}</div></div>
+        <div class="stat-card"><div class="stat-label">Debt/Equity</div><div class="stat-value small">${s.debtEquity ?? "—"}</div><div class="stat-sub">${s.dataSource==="live"||s.dataSource==="seeded"?"needs BALANCE_SHEET call — not pulled":"latest FY (mock)"}</div></div>
         <div class="stat-card"><div class="stat-label">ROE</div><div class="stat-value small">${s.roe?fmtPlain(s.roe):"—"}</div><div class="stat-sub">trailing 12mo</div></div>
         <div class="stat-card"><div class="stat-label">Revenue Growth</div><div class="stat-value small">${s.revGrowth?fmtPlain(s.revGrowth):"—"}</div><div class="stat-sub">${s.revGrowthSource==="sec-edgar"?`EDGAR YoY, as of ${escapeHtml(s.fundamentalsAsOf||"—")}`:"YoY (mock)"}</div></div>
         <div class="stat-card"><div class="stat-label">EBITDA Margin</div><div class="stat-value small">${s.ebitdaMargin?fmtPlain(s.ebitdaMargin):"—"}</div><div class="stat-sub">${s.ebitdaMarginSource==="sec-edgar"?`EDGAR, as of ${escapeHtml(s.fundamentalsAsOf||"—")}`:"latest FY (mock)"}</div></div>
-        <div class="stat-card"><div class="stat-label">Free Cash Flow</div><div class="stat-value small">${s.fcf?fmtMoneyB(s.fcf):"—"}</div><div class="stat-sub">${s.dataSource==="live"?"needs CASH_FLOW call — not pulled":"TTM (mock)"}</div></div>
+        <div class="stat-card"><div class="stat-label">Free Cash Flow</div><div class="stat-value small">${s.fcf?fmtMoneyB(s.fcf):"—"}</div><div class="stat-sub">${s.dataSource==="live"||s.dataSource==="seeded"?"needs CASH_FLOW call — not pulled":"TTM (mock)"}</div></div>
         <div class="stat-card"><div class="stat-label">Avg Daily Volume</div><div class="stat-value small">${fmtNum(s.avgVolume,1)}M</div><div class="stat-sub">${escapeHtml(s.assetClass)} · ${escapeHtml(s.sector)||"—"}</div></div>
         <div class="stat-card"><div class="stat-label">Revenue</div><div class="stat-value small">${s.revenueB!=null?fmtMoneyB(s.revenueB):"—"}</div><div class="stat-sub">${s.fundamentalsSource==="sec-edgar"?`EDGAR, as of ${escapeHtml(s.fundamentalsAsOf||"—")}`:"run Pull Fundamentals (SEC EDGAR)"}</div></div>
         <div class="stat-card"><div class="stat-label">EBITDA</div><div class="stat-value small">${s.ebitdaB!=null?fmtMoneyB(s.ebitdaB):"—"}</div><div class="stat-sub">${s.fundamentalsSource==="sec-edgar"?`EDGAR approx., as of ${escapeHtml(s.fundamentalsAsOf||"—")}`:"run Pull Fundamentals (SEC EDGAR)"}</div></div>
@@ -1772,6 +1787,7 @@ function viewValuation(){
     </select>
   </div>
   <div class="content">
+    ${seededDisclosureBanner()}
     <div class="chip-row">
       ${methodTabs.map(([k,l])=>`<div class="chip ${method===k?'chip-active':''}" data-vmethod="${k}">${l}</div>`).join("")}
     </div>
@@ -2043,10 +2059,11 @@ function viewMarketPulse(){
   <div class="topbar">
     <div>
       <div class="page-heading">Market Pulse</div>
-      <div class="page-sub">Broad-market context alongside your ticker-level research${mp && mp.lastRefreshed ? ` · refreshed ${new Date(mp.lastRefreshed).toLocaleString()}` : " · not refreshed yet"}</div>
+      <div class="page-sub">Broad-market context alongside your ticker-level research${mp && mp.lastRefreshed ? ` · ${mp.dataSource==='seeded'?'snapshot as of':'refreshed'} ${new Date(mp.lastRefreshed).toLocaleString()}` : " · not refreshed yet"}</div>
     </div>
   </div>
   <div class="content">
+    ${seededDisclosureBanner()}
     <div class="summary-grid summary-grid-4">
       <div class="stat-card">
         <div class="stat-label">Volatility (VIXY proxy)</div>
