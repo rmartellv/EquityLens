@@ -23,6 +23,7 @@ const https = require("https");
 const fs = require("fs");
 const path = require("path");
 const url = require("url");
+const edgar = require("./lib/edgar.js");
 
 const PORT = process.env.PORT || 3300;
 const ROOT = __dirname;
@@ -30,6 +31,7 @@ const PUBLIC_DIR = path.join(ROOT, "public");
 const DATA_DIR = path.join(ROOT, "data");
 const DATA_FILE = path.join(DATA_DIR, "data.json");
 const USAGE_FILE = path.join(DATA_DIR, "av-usage.json");
+const EDGAR_CACHE_FILE = path.join(DATA_DIR, "edgar-ticker-cik.json");
 const ENV_FILE = path.join(ROOT, ".env");
 
 const AV_DAILY_CAP = 25;         // Alpha Vantage free-tier daily request cap
@@ -55,6 +57,11 @@ function loadEnv() {
 }
 const ENV = { ...loadEnv(), ...process.env };
 const AV_KEY = ENV.ALPHAVANTAGE_API_KEY || "";
+// SEC asks every EDGAR API consumer to identify themselves with a descriptive
+// User-Agent + real contact (https://www.sec.gov/os/webmaster-faq#developers).
+// Sourced from the gitignored .env, never hardcoded here — see .env.example
+// and lib/edgar.js's file-header security notes.
+const SEC_EDGAR_CONTACT = ENV.SEC_EDGAR_CONTACT || "";
 
 /* ---------------- universe ---------------- */
 // The static "demo" universe. Anything imported beyond this becomes part of
@@ -620,6 +627,232 @@ async function runImportJob(job) {
   job.finishedAt = new Date().toISOString();
 }
 
+/**
+ * Fundamentals refresh job — pulls real revenue/EBITDA components/total
+ * debt/cash/shares-outstanding from SEC EDGAR (free, no daily cap, unlike
+ * Alpha Vantage above) for the given tickers, overwriting the Valuation
+ * tab's illustrative mock stand-ins (MOCK_NET_DEBT_B, derived shares-out)
+ * wherever real data resolves. Every field degrades independently to "keep
+ * what was already there" if a tag can't be found — never fabricated. See
+ * lib/edgar.js's file header for the security posture of these requests
+ * (fixed hosts, validated CIKs, capped response size, spaced requests).
+ */
+function startFundamentalsJob(tickers) {
+  if (currentJob && currentJob.status === "running") {
+    throw new Error("A job is already running. Wait for it to finish.");
+  }
+  const job = newJob(tickers.length, "fundamentals");
+  job.tickers = tickers;
+  currentJob = job;
+  runFundamentalsJob(job).catch((e) => {
+    job.status = "error";
+    job.log.push(`Fatal error: ${e.message}`);
+    job.finishedAt = new Date().toISOString();
+  });
+  return job;
+}
+
+// Only assigns keys whose value is non-null — so a ticker missing one tag
+// (e.g. no D&A, so ebitdaB comes back null) doesn't wipe an existing good
+// value for a field that resolved on a previous refresh.
+function mergeDefined(target, patch) {
+  Object.keys(patch).forEach((k) => { if (patch[k] != null) target[k] = patch[k]; });
+}
+
+async function runFundamentalsJob(job) {
+  const data = loadDataFile();
+  if (!SEC_EDGAR_CONTACT) {
+    job.log.push(`No SEC_EDGAR_CONTACT set in .env — using a generic placeholder User-Agent. SEC asks every API consumer to identify themselves (see .env.example); set this before relying on this refresh regularly.`);
+  }
+
+  let tickerCikMap;
+  try {
+    tickerCikMap = await edgar.loadTickerCikMap({ contact: SEC_EDGAR_CONTACT, cacheFile: EDGAR_CACHE_FILE, log: job.log });
+  } catch (e) {
+    job.status = "error";
+    job.log.push(`Couldn't load the SEC ticker→CIK lookup: ${e.message}`);
+    job.finishedAt = new Date().toISOString();
+    return;
+  }
+
+  for (const t of job.tickers) {
+    try {
+      const known = data.universe[t];
+      if (known && known.assetClass === "ETF") {
+        job.log.push(`${t}: ETF — SEC XBRL company financials don't apply the same way, skipped.`);
+        job.completed++;
+        continue;
+      }
+      const cik = edgar.resolveCik(t, tickerCikMap);
+      if (!cik) {
+        job.log.push(`${t}: no SEC CIK found (not SEC-registered under this ticker, or a foreign private issuer filing under a different identifier) — skipped.`);
+        job.completed++;
+        continue;
+      }
+      job.log.push(`${t}: fetching SEC EDGAR company facts (CIK ${cik})…`);
+      const facts = await edgar.fetchCompanyFacts(cik, SEC_EDGAR_CONTACT);
+      const fx = edgar.extractFundamentals(facts);
+      data.universe[t] = data.universe[t] || {};
+      mergeDefined(data.universe[t], {
+        revenueB: fx.revenueB, ebitdaB: fx.ebitdaB, totalDebtB: fx.totalDebtB, cashB: fx.cashB,
+        netDebtB: fx.netDebtB, sharesOutB: fx.sharesOutB,
+        // Overwrite the mock/AV revGrowth + ebitdaMargin fields (used everywhere
+        // else in the app — Stock Detail, Screener, Comparison chart) with real
+        // EDGAR-derived figures once available. Non-destructive: mergeDefined
+        // only assigns when the computed value is non-null, so a ticker whose
+        // XBRL history doesn't support one of these calcs keeps its prior value.
+        revGrowth: fx.revGrowthPct, ebitdaMargin: fx.ebitdaMarginPct,
+        revGrowthSource: fx.revGrowthPct != null ? "sec-edgar" : undefined,
+        ebitdaMarginSource: fx.ebitdaMarginPct != null ? "sec-edgar" : undefined,
+        fundamentalsSource: (fx.revenueB != null || fx.netDebtB != null || fx.sharesOutB != null) ? "sec-edgar" : undefined,
+        fundamentalsAsOf: fx.periodEnd, fundamentalsFiled: fx.filedDate, fundamentalsForm: fx.form,
+      });
+      const summary = [
+        fx.revenueB != null ? `revenue $${fx.revenueB.toFixed(1)}B` : null,
+        fx.ebitdaB != null ? `EBITDA (approx.) $${fx.ebitdaB.toFixed(1)}B` : null,
+        fx.netDebtB != null ? `net debt $${fx.netDebtB.toFixed(1)}B` : null,
+        fx.sharesOutB != null ? `${fx.sharesOutB.toFixed(2)}B shares out` : null,
+        fx.revGrowthPct != null ? `revenue growth ${(fx.revGrowthPct*100).toFixed(1)}% YoY` : null,
+        fx.ebitdaMarginPct != null ? `EBITDA margin ${(fx.ebitdaMarginPct*100).toFixed(1)}%` : null,
+      ].filter(Boolean).join(", ");
+      job.log.push(summary
+        ? `${t}: ${summary} — from ${fx.form || "a filing"}${fx.periodEnd ? ` as of ${fx.periodEnd}` : ""}.`
+        : `${t}: fetched OK, but none of the expected XBRL tags resolved for this filer — keeping existing figures.`);
+      job.completed++;
+      saveDataFile(data);
+      await edgar.sleep(edgar.MIN_SPACING_MS);
+    } catch (e) {
+      job.log.push(`${t}: FAILED — ${e.message}`);
+      job.completed++;
+    }
+  }
+
+  data.meta.lastRefreshed = new Date().toISOString();
+  saveDataFile(data);
+  job.status = "done";
+  job.finishedAt = new Date().toISOString();
+}
+
+/**
+ * Market Pulse job — pulls two pieces of broad-market context Alpha Vantage
+ * can actually provide, distinct from any single ticker's fundamentals:
+ *   1. VIXY (VIX short-term futures ETF) as a volatility-regime PROXY. AV has
+ *      no direct VIX index symbol (TIME_SERIES_DAILY?symbol=VIX 400s) — VIXY
+ *      is a real, tradeable ETF so the ordinary TIME_SERIES_DAILY call works,
+ *      but its price level tracks VIX FUTURES, not spot VIX, so don't render
+ *      it as if it were "the VIX at X" — always label it as a proxy.
+ *   2. SPY REALTIME_PUT_CALL_RATIO as a market-wide sentiment gauge (options
+ *      positioning on the S&P 500 ETF stands in for "the market" generally).
+ *      Confirmed working on a free-tier key (live-tested: SPY returned a 1.28
+ *      full-chain ratio). If a key ever lacks access to this endpoint for
+ *      some other reason, it fails with a clear log message rather than a
+ *      fabricated number (avRequest already treats AV's Note/Information
+ *      throttle-or-premium-gate responses as errors).
+ * Market breadth and factor-crowding are deliberately NOT fetched here — both
+ * are computed entirely client-side from data already on hand (tracked-ticker
+ * trend signals and the existing return-series correlation matrix), so they
+ * cost zero API budget and are always up to date; see recomputeStockStats()/
+ * viewMarketPulse() in public/index.html.
+ */
+const MARKET_PULSE_VIX_PROXY = "VIXY";
+const MARKET_PULSE_PUTCALL_SYMBOL = "SPY";
+
+function startMarketPulseJob() {
+  if (currentJob && currentJob.status === "running") {
+    throw new Error("A job is already running. Wait for it to finish.");
+  }
+  const job = newJob(2, "marketpulse");
+  currentJob = job;
+  runMarketPulseJob(job).catch((e) => {
+    job.status = "error";
+    job.log.push(`Fatal error: ${e.message}`);
+    job.finishedAt = new Date().toISOString();
+  });
+  return job;
+}
+
+async function runMarketPulseJob(job) {
+  const data = loadDataFile();
+  data.marketPulse = data.marketPulse || {};
+
+  if (!AV_KEY) {
+    // Deterministic mock, same convention as mockPricesFor for tickers —
+    // never a live-looking number when there's no key configured.
+    const series = Array.from({ length: 60 }, (_, i) => 18 + Math.sin(i / 5) * 4);
+    job.log.push("No ALPHAVANTAGE_API_KEY set — using illustrative mock VIXY series and put/call ratio.");
+    data.marketPulse = {
+      vixy: { series, price: series[series.length - 1], lastRefreshed: new Date().toISOString() },
+      putCall: { ratioFullChain: 0.85, byExpiration: [], lastRefreshed: new Date().toISOString() },
+      dataSource: "mock",
+      lastRefreshed: new Date().toISOString(),
+    };
+    job.completed = 2;
+    saveDataFile(data);
+    job.status = "done";
+    job.finishedAt = new Date().toISOString();
+    return;
+  }
+
+  if (remainingCallsToday() < 2) {
+    job.status = "error";
+    job.log.push(`Not enough free-tier calls remaining today (need 2, have ${remainingCallsToday()}).`);
+    job.finishedAt = new Date().toISOString();
+    return;
+  }
+
+  let vixyOk = false, putCallOk = false;
+
+  try {
+    job.log.push(`Fetching ${MARKET_PULSE_VIX_PROXY} (volatility-regime proxy)…`);
+    const priceResp = await avRequest({ function: "TIME_SERIES_DAILY", symbol: MARKET_PULSE_VIX_PROXY, outputsize: "compact" });
+    recordCalls(1);
+    const rawSeries = priceResp["Time Series (Daily)"];
+    if (rawSeries) {
+      const dates = Object.keys(rawSeries).sort();
+      // Sanity-bound each close the same way the put/call ratio is bounded
+      // below — VIXY realistically trades well under $1,000/share; reject
+      // anything outside that rather than let a glitched/malformed value
+      // propagate into a divide-by-a-bad-number in the client's 5-day-change calc.
+      const series = dates.map((d) => parseFloat(rawSeries[d]["4. close"])).filter((n) => isFinite(n) && n > 0 && n < 1000);
+      data.marketPulse.vixy = { series: series.slice(-60), price: series[series.length - 1] ?? null, lastRefreshed: new Date().toISOString() };
+      job.log.push(`${MARKET_PULSE_VIX_PROXY}: ${series.length} daily closes fetched, latest $${series[series.length - 1]?.toFixed(2)}.`);
+      vixyOk = true;
+    } else {
+      job.log.push(`${MARKET_PULSE_VIX_PROXY}: fetched OK but no time series in the response.`);
+    }
+  } catch (e) {
+    job.log.push(`${MARKET_PULSE_VIX_PROXY}: FAILED — ${e.message}`);
+  }
+  job.completed++;
+  saveDataFile(data);
+  await sleep(AV_MIN_SPACING_MS);
+
+  try {
+    job.log.push(`Fetching put/call ratio for ${MARKET_PULSE_PUTCALL_SYMBOL} (market-wide sentiment proxy)…`);
+    const pcResp = await avRequest({ function: "REALTIME_PUT_CALL_RATIO", symbol: MARKET_PULSE_PUTCALL_SYMBOL });
+    const ratio = num(pcResp.put_call_ratio_full_chain);
+    if (ratio != null && ratio >= 0 && ratio <= 20) {
+      const byExpiration = Array.isArray(pcResp.put_call_ratio_by_expiration)
+        ? pcResp.put_call_ratio_by_expiration.slice(0, 12).map((e) => ({ date: stripHtmlChars(e.date, 20), value: num(e.value) })).filter((e) => e.value != null)
+        : [];
+      data.marketPulse.putCall = { ratioFullChain: ratio, byExpiration, lastRefreshed: new Date().toISOString() };
+      job.log.push(`${MARKET_PULSE_PUTCALL_SYMBOL}: put/call ratio ${ratio.toFixed(2)} (full chain).`);
+      putCallOk = true;
+    } else {
+      job.log.push(`${MARKET_PULSE_PUTCALL_SYMBOL}: fetched OK but ratio missing or out of a sane range — not stored.`);
+    }
+  } catch (e) {
+    job.log.push(`${MARKET_PULSE_PUTCALL_SYMBOL}: FAILED — ${e.message}${/premium|not supported|not authorized/i.test(e.message) ? " (this endpoint may require a paid Alpha Vantage plan)" : ""}`);
+  }
+  job.completed++;
+
+  data.marketPulse.dataSource = vixyOk && putCallOk ? "live" : (vixyOk || putCallOk) ? "mixed" : (data.marketPulse.vixy || data.marketPulse.putCall) ? "stale" : "pending";
+  data.marketPulse.lastRefreshed = new Date().toISOString();
+  saveDataFile(data);
+  job.status = "done";
+  job.finishedAt = new Date().toISOString();
+}
+
 /* ---------------- data.json persistence ---------------- */
 function loadDataFile() {
   try {
@@ -628,9 +861,10 @@ function loadDataFile() {
     d.fxRates = d.fxRates || { USD: 1 };
     d.dividends = d.dividends || {};
     d.newsSentiment = d.newsSentiment || {};
+    d.marketPulse = d.marketPulse || null;
     return d;
   } catch {
-    return { meta: { source: "mock", lastRefreshed: null, benchmarkSource: "mock" }, universe: {}, prices: {}, positions: {}, fxRates: { USD: 1 }, dividends: {}, newsSentiment: {} };
+    return { meta: { source: "mock", lastRefreshed: null, benchmarkSource: "mock" }, universe: {}, prices: {}, positions: {}, fxRates: { USD: 1 }, dividends: {}, newsSentiment: {}, marketPulse: null };
   }
 }
 function saveDataFile(data) {
@@ -686,6 +920,33 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  if (req.method === "POST" && parsed.pathname === "/api/refresh-fundamentals") {
+    const body = await readBody(req);
+    const data = loadDataFile();
+    // Same whitelist gate as /api/refresh: a ticker is only ever acted on if
+    // it already matches a known entry, never trusted as a raw string used
+    // to build a CIK/URL — CIK resolution happens server-side in
+    // runFundamentalsJob via the SEC's own ticker file, not from this body.
+    const tickers = Array.isArray(body.tickers) && body.tickers.length
+      ? body.tickers.filter((t) => isKnownTicker(t, data))
+      : DEFAULT_TICKERS.slice(0, 8);
+    try {
+      const job = startFundamentalsJob(tickers);
+      return sendJson(res, 200, { jobId: job.id, total: job.total });
+    } catch (e) {
+      return sendJson(res, 409, { error: e.message });
+    }
+  }
+
+  if (req.method === "POST" && parsed.pathname === "/api/refresh-market-pulse") {
+    try {
+      const job = startMarketPulseJob();
+      return sendJson(res, 200, { jobId: job.id, total: job.total });
+    } catch (e) {
+      return sendJson(res, 409, { error: e.message });
+    }
+  }
+
   if (req.method === "GET" && parsed.pathname === "/api/refresh/status") {
     if (!currentJob) return sendJson(res, 404, { error: "No job has run yet." });
     return sendJson(res, 200, currentJob);
@@ -717,4 +978,5 @@ server.listen(PORT, () => {
   console.log(`EquityLens running at http://localhost:${PORT}`);
   console.log(AV_KEY ? "Alpha Vantage key detected — live refresh enabled." : "No ALPHAVANTAGE_API_KEY set — Refresh Data will regenerate mock data. See README.md.");
   console.log(`Free-tier calls remaining today: ${remainingCallsToday()}/${AV_DAILY_CAP}`);
+  console.log(SEC_EDGAR_CONTACT ? "SEC EDGAR contact configured — Pull Fundamentals enabled." : "No SEC_EDGAR_CONTACT set — Pull Fundamentals will still work but sends a generic User-Agent. Set it in .env (see .env.example).");
 });

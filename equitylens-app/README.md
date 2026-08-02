@@ -1,8 +1,40 @@
-# EquityLens (MVP 5 — Portfolio Management + Dividends/News)
+# EquityLens (MVP 6.2 — Valuation Engine + SEC EDGAR Fundamentals + Market Pulse)
 
 **Live demo:** https://equitylens-n9bz.onrender.com (runs in mock mode — no API key configured on the public deployment, see Security notes below). Free-tier hosting spins down after 15 minutes idle; first load after that takes ~30 seconds to wake back up.
 
-Equity research & portfolio risk workbench: fundamentals, portfolio risk KPIs (Sharpe, Sortino, beta, VaR/CVaR, correlation, HHI/Effective N), and a technical/valuation screener (momentum, RSI, moving averages, Fibonacci retracement, P/E-vs-own-history) across a 14-name universe (11 single names + SOXX/XLE/GLD ETFs).
+Equity research & portfolio risk workbench: fundamentals, portfolio risk KPIs (Sharpe, Sortino, beta, VaR/CVaR, correlation, HHI/Effective N), a technical/valuation screener (momentum, RSI, moving averages, Fibonacci retracement, P/E-vs-own-history), a full valuation engine (DCF, Trading Multiples, Precedent Transactions, LBO), and a Market Pulse tab (volatility proxy, put/call sentiment, breadth, factor-crowding proxy) across a 14-name universe (11 single names + SOXX/XLE/GLD ETFs).
+
+## Valuation (DCF, Trading Multiples, Precedent Transactions, LBO)
+
+A dedicated **Valuation** tab, one ticker at a time (equities only — ETFs don't have a standalone DCF/comps/LBO valuation, the tab tells you so if you pick one). Formulas: `equitylens-valuation` skill.
+
+- **DCF** — 5-year (adjustable) FCF projection tapering from a near-term growth rate to a terminal growth rate, discounted at WACC, with a Gordon Growth terminal value. WACC can be typed directly or derived via a built-in **CAPM calculator** (risk-free rate, beta, equity risk premium, pre-tax cost of debt, tax rate, target debt weight — all editable, defaulting to the app's existing `RF` and the ticker's own computed beta). Always shown alongside a 3×3 WACC × terminal-growth sensitivity grid, not just a single point estimate.
+- **Trading Multiples** — peer set is chip-selectable (defaults to same-sector tickers already used in the Comparison view); implied value shown two ways, peer median P/E × target EPS, and peer median EV/FCF × target FCF.
+- **Precedent Transactions** — **illustrative only**, clearly labeled in-app: runs off a 3-deal hardcoded placeholder set, not a real M&A comps database (no free-tier API for this the way there is for market data — would need Refinitiv/PitchBook/Capital IQ in production).
+- **LBO** — entry/exit multiple, leverage, interest rate, hold period, and FCF sweep %, with a year-by-year debt paydown schedule and MOIC/IRR output.
+
+**The data-model substitution that shapes all four, until you pull real fundamentals (see below):** EquityLens has FCF in dollars but never pulls revenue/EBITDA in dollars from Alpha Vantage (would need `INCOME_STATEMENT`, not fetched there to conserve API budget). So **EV/FCF stands in for EV/EBITDA**, and net debt uses a small illustrative mock field (`MOCK_NET_DEBT_B`, $B, negative = net cash) rather than `debtEquity × marketCap` (that combination would apply a book-equity ratio to market-value equity and blows up for high-multiple names — would imply NVDA carries ~$700B of debt). Once you run **Pull Fundamentals** (below), real EBITDA/net debt/shares outstanding from SEC filings take over automatically — a `src-pill` badge next to the Valuation tab's ticker name shows `EDGAR` (real) vs `illustrative` (mock) per name. See the `equitylens-valuation` skill for the full formula reference.
+
+## Fundamentals via SEC EDGAR (free, no API key, no daily cap)
+
+**Refresh Data → Pull Fundamentals** wires the Valuation tab's three currently-mocked/derived fields to the real thing, straight from SEC filings: **revenue, EBITDA** (Operating Income + D&A, both XBRL-tagged), **total debt, cash, and shares outstanding**. Equities only (ETFs are skipped — they don't file 10-Ks). No API key needed, no 25/day cap like Alpha Vantage, since it's a public SEC service — but set `SEC_EDGAR_CONTACT` in `.env` first (see below) and don't run it more than you need to; this data moves quarterly, not daily, so once per name per earnings cycle is enough.
+
+- **Setup:** copy `SEC_EDGAR_CONTACT=YourName your-email@example.com` into `.env` (SEC asks every API consumer for a descriptive User-Agent + real contact: https://www.sec.gov/os/webmaster-faq#developers). It still works without this — you'll just send a generic placeholder User-Agent, which the startup log will flag.
+- **How it resolves data:** ticker → CIK via SEC's own `company_tickers.json` (cached locally, refreshed at most weekly) → full XBRL `companyfacts` payload for that CIK → the specific tags extracted, trying a priority-ordered list of known aliases per field (XBRL tagging isn't standardized across filers/years — see `lib/edgar.js` for the full alias lists and the reasoning).
+- **Partial results are expected and disclosed, not hidden.** Some filers don't tag D&A separately (so EBITDA comes back null for them), or use an uncommon debt tag; each field degrades independently rather than guessing — the job log tells you exactly what resolved per ticker. Never overwrites a previously-good field with a null.
+- **Financials (JPM) are a weak fit for this whole valuation engine, EDGAR data or not** — leverage is the business model for a bank, not a net-debt bridge item, so EV/DCF-style valuation understates what a bank actually is. P/B or a dividend-discount model is the standard alternative in practice; this is flagged in the `equitylens-valuation` skill too.
+- **Security posture** — see the Security notes section below; `lib/edgar.js`'s file header has the full reasoning (fixed hosts, validated CIKs, capped response size, sanitized User-Agent, spaced requests).
+
+## Market Pulse (VIX proxy, put/call sentiment, breadth, factor-crowding proxy)
+
+A dedicated **Market Pulse** tab with four cards, each honestly scoped to what's actually available rather than faking a Bloomberg-terminal-style feed:
+
+- **Volatility** — **VIXY** (VIX short-term futures ETF) as a proxy. Alpha Vantage has no direct spot-VIX symbol (`TIME_SERIES_DAILY?symbol=VIX` 400s); VIXY is a real, tradeable ETF so the ordinary price endpoint works, but its price level tracks VIX *futures*, not the index itself — the card shows trend/direction (5-day % change), not a headline "VIX at X" number, and says so.
+- **Put/Call Sentiment** — SPY full-chain options put/call ratio, live via Alpha Vantage's `REALTIME_PUT_CALL_RATIO` (used as a market-wide proxy, run on the S&P 500 ETF rather than any single name). Tagged Bullish/Neutral/Bearish using Alpha Vantage's own stated convention (≤0.60 bullish, ≥1.00 bearish). Confirmed working on the free tier (live-tested: SPY returned a 1.28 full-chain ratio).
+- **Market Breadth** — computed live, client-side, **zero extra API cost**: % of your tracked tickers in an uptrend (reusing the existing trend-signal calc) plus today's advancers/decliners. This is a real number, just honestly scoped to the app's own tracked universe — there's no free data source for a true NYSE/Nasdaq advance-decline line, so it doesn't claim to be one.
+- **Factor Crowding (proxy)** — also computed live, client-side, zero extra cost: average pairwise 60-day return correlation across tracked *equities* (ETFs excluded, since mixing in GLD/XLE would just mechanically dilute the number rather than reflect stock-picking crowding). Bucketed Low/Moderate/High. This is a rough illustrative proxy, not a real positioning metric — genuine crowding analysis needs 13F holdings concentration, short interest, or ETF-flow data, none of which is available free.
+
+**Refresh Data → Refresh Market Pulse** pulls the two live pieces (VIXY + SPY put/call, 2 Alpha Vantage calls total); breadth and crowding update automatically any time ticker data changes, no separate refresh needed. Without an API key, VIXY/put-call regenerate as illustrative mock values, same convention as the rest of the app.
 
 Runs as a tiny local app: a zero-dependency Node server plus a static frontend. Works fully on deterministic mock data out of the box; optionally pulls real data from Alpha Vantage when you add an API key and click **Refresh Data**.
 
@@ -92,17 +124,27 @@ For each new ticker not already known to the app: if today's Alpha Vantage budge
 equitylens-app/
 ├── server.js              Zero-dependency Node server: static file serving,
 │                           POST /api/refresh, POST /api/import-portfolio,
+│                           POST /api/refresh-fundamentals (SEC EDGAR),
+│                           POST /api/refresh-market-pulse (VIXY + SPY put/call),
 │                           GET /api/refresh/status, GET /api/status, GET /data.json.
 │                           fetchTickerLive() resolves+fetches any ticker (known
 │                           or newly imported), tries OVERVIEW then ETF_PROFILE,
 │                           falls back to SYMBOL_SEARCH for company-name inputs.
 │                           Optional DIVIDENDS + NEWS_SENTIMENT fetch per ticker
 │                           (opt-in, +2 calls/ticker) via fetchDividendsFor()/
-│                           fetchNewsSentimentFor().
+│                           fetchNewsSentimentFor(). runFundamentalsJob() drives
+│                           the SEC EDGAR pull via lib/edgar.js. runMarketPulseJob()
+│                           drives the VIXY/put-call pull, stored as data.marketPulse.
 ├── lib/
-│   └── technical-indicators.js   Pure functions: SMA/EMA, RSI, Fibonacci
-│                                  retracement, rate-of-change, trend signal,
-│                                  P/E percentile & valuation tag
+│   ├── technical-indicators.js   Pure functions: SMA/EMA, RSI, Fibonacci
+│   │                              retracement, rate-of-change, trend signal,
+│   │                              P/E percentile & valuation tag
+│   └── edgar.js                  SEC EDGAR client: ticker→CIK resolution
+│                                  (cached weekly), XBRL companyfacts fetch,
+│                                  tag-alias extraction for revenue/EBITDA/
+│                                  debt/cash/shares outstanding. Fixed hosts,
+│                                  validated CIKs, capped response size,
+│                                  sanitized User-Agent — see its file header.
 ├── public/
 │   └── index.html          The app: mock data engine (fallback/default) +
 │                            risk-kpis formulas + technical-indicators formulas
@@ -110,12 +152,15 @@ equitylens-app/
 │                            rebalancing drift, concentration/correlation/
 │                            liquidity flags, style box, composite score,
 │                            Monte Carlo, empirical VaR/CVaR, dividend income)
-│                            + all 5 views + Excel portfolio import (SheetJS)
+│                            + valuation engine (DCF/Multiples/Precedent/LBO)
+│                            + market-pulse engine (computeMarketBreadth,
+│                            computeCrowdingProxy — pure, zero-API-cost)
+│                            + all 7 views + Excel portfolio import (SheetJS)
 │                            with a dynamic ticker universe (ensureTickerExists)
 ├── data/                   Created at runtime — data.json (cached results,
 │                           now including positions{}, fxRates{}, dividends{},
-│                           and newsSentiment{}) and av-usage.json (daily call
-│                           counter). Gitignored.
+│                           newsSentiment{}, and marketPulse{}) and
+│                           av-usage.json (daily call counter). Gitignored.
 ├── .env.example             Copy to .env and add your API key
 └── .gitignore
 ```
@@ -124,12 +169,17 @@ Design principle carried over from the `equitylens-risk-kpis` skill: every formu
 
 ## Security notes
 
-The app has no authentication — `/api/refresh` and `/api/import-portfolio` are open endpoints, which matters once this is deployed to a public URL rather than run locally:
+The app has no authentication — `/api/refresh`, `/api/import-portfolio`, `/api/refresh-fundamentals`, and `/api/refresh-market-pulse` are open endpoints, which matters once this is deployed to a public URL rather than run locally. `/api/refresh-market-pulse` takes no request body at all (it always fetches the same two fixed symbols, VIXY and SPY) — no user-controlled input reaches it, so there's no injection surface there beyond the shared daily-quota cost of anyone hitting the endpoint repeatedly.
 
 - **Import-field validation.** `runImportJob` (server.js) only ever accepts a symbol as a ticker if it matches `TICKER_PATTERN` (`[A-Z0-9.\-]{1,6}`) — either because the raw input already looked like one, or because it was resolved through Alpha Vantage's `SYMBOL_SEARCH` and the *returned* symbol is itself re-validated against the same pattern. Anything that doesn't validate is rejected and logged, not stored. `market`/`currency`/`purchaseDate` are stripped of HTML metacharacters and length-capped (`stripHtmlChars`, `sanitizeCurrency`, `sanitizeMarket`). This closes a stored-XSS path where an unauthenticated import could otherwise write arbitrary strings into the shared `data.json` and have them execute in other visitors' browsers via `innerHTML`.
-- **Render-time escaping.** `escapeHtml()` (index.html) is applied to every name/sector/headline field that could originate from an import or from Alpha Vantage before it's interpolated into an `innerHTML` template — defense in depth on top of the server-side validation above, in case any other write path is added later.
+- **Render-time escaping.** `escapeHtml()` (index.html) is applied to every name/sector/headline field that could originate from an import, Alpha Vantage, or SEC EDGAR before it's interpolated into an `innerHTML` template — defense in depth on top of the server-side validation above, in case any other write path is added later.
 - **No CORS wildcard.** `sendJson` no longer sends `Access-Control-Allow-Origin: *`. The frontend is same-origin with the API, so there's no legitimate reason for another website's script to call these endpoints on a visitor's behalf.
-- **Recommended for the public deployment:** don't set `ALPHAVANTAGE_API_KEY` there. Keeping the hosted instance in mock mode means a stranger hitting Refresh/Import can't burn your personal daily quota, and removes any incentive to probe the refresh endpoint at all.
+- **`/api/refresh-fundamentals` only ever acts on tickers already known to the app** — the same `isKnownTicker()` whitelist gate as `/api/refresh`. A CIK is never accepted from the client; it's always resolved server-side from SEC's own ticker file (`lib/edgar.js`'s `resolveCik`), and validated against `/^\d{10}$/` before it's ever concatenated into a URL. There is deliberately no generic "fetch this URL" helper anywhere near this code path — only two hardcoded hosts (`www.sec.gov`, `data.sec.gov`) are ever contacted, which forecloses an SSRF-style relay through this server even if a future bug tried to pass through a caller-supplied host or path.
+- **Response-size cap and timeout on every SEC EDGAR request** (`lib/edgar.js`: 20MB cap, 15s timeout) — a malformed or anomalously large response gets the request destroyed rather than exhausting process memory or hanging a connection.
+- **Sanitized User-Agent.** Node's `http` module throws on any header value containing a byte outside printable ASCII — a real bug caught during testing, where the fallback User-Agent's em dash crashed every request. Both the fallback and any custom `SEC_EDGAR_CONTACT` value are stripped to safe printable ASCII before use, so a stray accented character or smart quote in your contact string degrades gracefully instead of breaking the feature.
+- **Contact info stays out of committed source.** `SEC_EDGAR_CONTACT` lives in the gitignored `.env` (see `.env.example`), never hardcoded — same handling as `ALPHAVANTAGE_API_KEY`, deliberate since this repo has a public live deployment.
+- **Good-citizen rate limiting toward a shared public resource.** SEC's documented cap is 10 req/sec across all EDGAR domains; requests here are spaced at 5 req/sec (`MIN_SPACING_MS`), and the ~1MB ticker→CIK lookup file is cached locally and only re-fetched at most weekly rather than on every refresh click.
+- **Recommended for the public deployment:** don't set `ALPHAVANTAGE_API_KEY` there. Keeping the hosted instance in mock mode means a stranger hitting Refresh/Import can't burn your personal daily quota, and removes any incentive to probe the refresh endpoints at all. `SEC_EDGAR_CONTACT` has no comparable abuse cost (no quota to burn), but leaving it unset on a public deployment means visitors triggering Pull Fundamentals would do so under a generic, non-identifying User-Agent — fine functionally, just worth knowing.
 
 ## Known limitations (worth being upfront about)
 
@@ -141,8 +191,15 @@ The app has no authentication — `/api/refresh` and `/api/import-portfolio` are
 - Scenario stress testing propagates shocks through beta only — idiosyncratic (stock-specific) risk isn't modeled, standard for factor-based stress testing but worth knowing.
 - Monte Carlo projection uses the portfolio's own trailing annualized return/volatility as GBM inputs — a projection of what the recent regime implies, not a forecast, and short trailing windows (60 sessions) make the vol input noisy.
 - Dividend income projection falls back to current yield × price when real trailing-12-month history hasn't been fetched (`DIVIDENDS` is opt-in) — the Holdings/Income tables label which source is being used per ticker.
+- **SEC EDGAR extraction (`lib/edgar.js`) was built and unit-tested against real XBRL tag names/shapes, but couldn't be live-tested end-to-end against `data.sec.gov` in the environment it was built in (no network egress there).** Run one real **Pull Fundamentals** locally and check the job log before trusting the numbers — some filers use uncommon tags the alias lists don't cover yet, in which case that field comes back null (not wrong, just absent) rather than guessed.
+- **Market Pulse's VIXY volatility card is a proxy, not the real VIX index** — Alpha Vantage has no direct spot-VIX symbol, so VIXY (VIX futures ETF) stands in; its absolute price level does not equal "the VIX," only its trend/direction is a fair read.
+- **Market Pulse's breadth is scoped to this app's own tracked universe (up to 14 tickers), not the real market** — there's no free data source for a true NYSE/Nasdaq advance-decline line, so this reads "9 of 14 tracked names in an uptrend," not "68% of the NYSE is advancing."
+- **Market Pulse's factor-crowding card is a correlation-based illustrative proxy, not a real positioning metric** — genuine crowding analysis needs 13F holdings concentration, short interest, or ETF-flow data, none of which is available free; average pairwise return correlation across tracked equities is directionally informative at best.
 
 ## Next steps (not built yet)
 
 - Wire the `EARNINGS` endpoint for real historical P/E instead of the same-EPS approximation.
 - Upgrade the live deployment to a paid always-on tier (currently free-tier Render, which sleeps after 15 min idle) once this is being actively shared.
+- Expand `lib/edgar.js`'s tag-alias lists as real filers turn up coverage gaps (see the limitation above) — the extraction code doesn't need to change, only the alias arrays.
+- DCF/LBO still run off FCF even for tickers with real EBITDA now available (only the Trading Multiples panel upgrades to a true EV/EBITDA basis) — extending DCF/LBO to optionally use real EBITDA-derived cash flow is a reasonable next pass.
+- If a real broad-market breadth feed (advance/decline) or a genuine positioning/crowding data source ever becomes available on a free tier, both Market Pulse cards (breadth, crowding) are built to swap in — the client-side calc functions (`computeMarketBreadth`, `computeCrowdingProxy`) are the only things that would change, same "formulas are data-source agnostic" principle as the risk-kpis/technical-indicators skills.

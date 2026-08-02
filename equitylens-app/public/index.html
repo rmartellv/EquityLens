@@ -161,6 +161,13 @@ tbody tr:hover{background:#FAFBFD;}
 .range-dot{position:absolute;top:-3px;width:13px;height:13px;border-radius:50%;background:var(--accent);border:2px solid #fff;transform:translateX(-50%);}
 .link{color:var(--accent);cursor:pointer;font-size:12px;}
 .link:hover{text-decoration:underline;}
+.val-form{display:flex;flex-direction:column;gap:9px;}
+.val-row{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:12.5px;color:var(--text);}
+.val-row label{color:var(--muted);}
+.val-input{width:86px;background:var(--surface-2);border:1px solid var(--border);border-radius:6px;padding:6px 8px;font-family:'JetBrains Mono',monospace;font-size:12.5px;text-align:right;color:var(--text);}
+.val-pct{display:flex;align-items:center;gap:5px;color:var(--muted);}
+.val-output-big{font-family:'JetBrains Mono',monospace;font-size:30px;font-weight:700;}
+.val-divider{border-top:1px solid var(--border);margin:4px 0;}
 ::-webkit-scrollbar{height:8px;width:8px;} ::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px;}
 canvas{max-width:100%;}
 </style>
@@ -169,14 +176,15 @@ canvas{max-width:100%;}
 <div class="nav">
   <div>
     <div class="nav-brand">Equity<span>Lens</span></div>
-    <div class="nav-tag">MVP 5 · Portfolio Mgmt + Dividends/News</div>
+    <div class="nav-tag">MVP 6 · Valuation Engine</div>
   </div>
   <div class="nav-links" id="navLinks"></div>
   <div class="data-status" id="dataStatus">Loading…</div>
   <button class="refresh-btn" id="openRefreshModal">⟳ Refresh Data</button>
   <div class="nav-footer">
-    Formulas: equitylens-risk-kpis<br>
-    &amp; equitylens-technical-indicators skills<br>
+    Formulas: equitylens-risk-kpis,<br>
+    equitylens-technical-indicators<br>
+    &amp; equitylens-valuation skills<br>
     Local server required for live refresh
   </div>
 </div>
@@ -256,6 +264,18 @@ const MOCK_MARKETCAP = {
   NVDA:3.35e12, MSFT:3.30e12, GOOGL:2.15e12, AAPL:3.40e12, META:1.30e12,
   JPM:620e9, V:600e9, SHEL:205e9, XOM:480e9, AMZN:2.10e12, TSLA:840e9,
 };
+// Illustrative net debt (USD billions) — standing in for a real BALANCE_SHEET
+// pull (total debt minus cash & equivalents), which isn't fetched live (same
+// gap as the Debt/Equity note above). Order-of-magnitude only, deliberately
+// NOT derived from debtEquity x marketCap — that combination back-implies a
+// dollar debt figure from a book-equity ratio applied to market-value equity,
+// which blows up for high-multiple names (e.g. would imply ~$700B+ of "debt"
+// for NVDA). Used by the Valuation tab (equitylens-valuation skill) for
+// DCF/Multiples/Precedent Transactions net-debt bridges. Negative = net cash.
+const MOCK_NET_DEBT_B = {
+  NVDA:-10, MSFT:-15, GOOGL:-60, AAPL:50, META:-20,
+  JPM:250, V:5, SHEL:15, XOM:5, AMZN:10, TSLA:-5,
+};
 const MOCK_ANALYST = {
   NVDA: { analystStrongBuy:28, analystBuy:9,  analystHold:3,  analystSell:0, analystStrongSell:0, analystTargetPrice:162.50 },
   MSFT: { analystStrongBuy:22, analystBuy:12, analystHold:2,  analystSell:0, analystStrongSell:0, analystTargetPrice:485.00 },
@@ -285,6 +305,7 @@ TICKERS.forEach(t=>{
   UNIVERSE[t].lastRefreshed = null;
   if(MOCK_ANALYST[t]) Object.assign(UNIVERSE[t], MOCK_ANALYST[t]);
   if(MOCK_MARKETCAP[t]) UNIVERSE[t].marketCap = MOCK_MARKETCAP[t];
+  if(MOCK_NET_DEBT_B[t]!=null) UNIVERSE[t].netDebtB = MOCK_NET_DEBT_B[t];
 });
 let BENCH_RETURNS_FULL = MOCK_BENCH_RETURNS;
 
@@ -400,6 +421,7 @@ async function loadLiveData(){
     if(json.fxRates) FX_RATES = { ...FX_RATES, ...json.fxRates };
     Object.keys(json.dividends||{}).forEach(t=>{ DIVIDENDS[t] = json.dividends[t]; });
     Object.keys(json.newsSentiment||{}).forEach(t=>{ NEWS_SENTIMENT[t] = json.newsSentiment[t]; });
+    if(json.marketPulse) MARKET_PULSE = json.marketPulse;
     rebuildRiskWindow();
     recomputeStockStats();
   } catch(e){ /* server not running — stay on mock engine */ }
@@ -838,6 +860,223 @@ function recomputeStockStats(){
 recomputeStockStats();
 
 /* =========================================================================
+   VALUATION ENGINE — equitylens-valuation skill
+   DCF, Trading Multiples, Precedent Transactions (illustrative), LBO.
+   Pure functions — no ticker strings, no API calls, same design principle as
+   the risk-kpis engine above. The one data-model gap that shapes every
+   formula here: EquityLens has FCF in dollars but never pulls revenue/EBITDA
+   in dollars (would need INCOME_STATEMENT — not fetched, to conserve API
+   budget, same tradeoff as debtEquity/fcf already documented in the README).
+   So EV/FCF substitutes for EV/EBITDA everywhere below — directionally
+   consistent (both are cash-flow multiples), not a like-for-like match.
+   Net debt uses a small illustrative mock field (MOCK_NET_DEBT_B, $B) rather
+   than being derived from debtEquity x marketCap — that combination back-
+   implies a dollar debt figure from a book-equity ratio applied to market-
+   value equity, which blows up for high-multiple names. Shares outstanding
+   is derived as marketCap / price / 1e9 (billions of shares, to stay unit-
+   consistent with FCF/net debt, both in $B). See the equitylens-valuation
+   skill for the full write-up and live-data upgrade path.
+   ========================================================================= */
+
+// --- WACC / CAPM ---
+function calculateWACC({ rf, beta, erp, costOfDebtPretax, taxRate, debtWeight }) {
+  const costOfEquity = rf + beta * erp;
+  const costOfDebtAfterTax = costOfDebtPretax * (1 - taxRate);
+  const equityWeight = 1 - debtWeight;
+  const wacc = equityWeight * costOfEquity + debtWeight * costOfDebtAfterTax;
+  return { costOfEquity, costOfDebtAfterTax, equityWeight, debtWeight, wacc };
+}
+
+// --- DCF ---
+function projectFCF(fcfBase, nearTermGrowth, terminalGrowth, years) {
+  const path = [];
+  let fcf = fcfBase;
+  for (let y = 1; y <= years; y++) {
+    const g = nearTermGrowth + (terminalGrowth - nearTermGrowth) * (y - 1) / Math.max(1, years - 1);
+    fcf = fcf * (1 + g);
+    path.push({ year: y, growth: g, fcf });
+  }
+  return path;
+}
+// Returns null if wacc <= terminalGrowth (Gordon Growth terminal value is undefined/negative otherwise).
+function calculateDCF({ fcfBase, nearTermGrowth, terminalGrowth, years = 5, wacc, netDebt = 0, sharesOut }) {
+  if (wacc == null || wacc <= terminalGrowth) return null;
+  const path = projectFCF(fcfBase, nearTermGrowth, terminalGrowth, years);
+  let pvSum = 0;
+  const rows = path.map((p) => {
+    const discountFactor = 1 / Math.pow(1 + wacc, p.year);
+    const pv = p.fcf * discountFactor;
+    pvSum += pv;
+    return { ...p, discountFactor, pv };
+  });
+  const finalFcf = path[path.length - 1].fcf;
+  const terminalValue = (finalFcf * (1 + terminalGrowth)) / (wacc - terminalGrowth);
+  const pvTerminalValue = terminalValue / Math.pow(1 + wacc, years);
+  const enterpriseValue = pvSum + pvTerminalValue;
+  const equityValue = enterpriseValue - netDebt;
+  const impliedSharePrice = sharesOut > 0 ? equityValue / sharesOut : null;
+  return {
+    rows, terminalValue, pvTerminalValue, enterpriseValue, equityValue, impliedSharePrice,
+    pvOfTerminalPct: enterpriseValue > 0 ? pvTerminalValue / enterpriseValue : null,
+  };
+}
+// 3x3 grid: rows = WACC (-1%, base, +1%), cols = terminal growth (-0.5%, base, +0.5%).
+function dcfSensitivity({ fcfBase, nearTermGrowth, terminalGrowth, years, wacc, netDebt, sharesOut }) {
+  const waccSteps = [wacc - 0.01, wacc, wacc + 0.01];
+  const tgSteps = [terminalGrowth - 0.005, terminalGrowth, terminalGrowth + 0.005];
+  return waccSteps.map((w) => tgSteps.map((tg) => {
+    const r = calculateDCF({ fcfBase, nearTermGrowth, terminalGrowth: tg, years, wacc: w, netDebt, sharesOut });
+    return r ? r.impliedSharePrice : null;
+  }));
+}
+
+// --- Trading Multiples ---
+function peerMedian(values) {
+  const v = values.filter((x) => x != null).sort((a, b) => a - b);
+  if (!v.length) return null;
+  const mid = Math.floor(v.length / 2);
+  return v.length % 2 ? v[mid] : (v[mid - 1] + v[mid]) / 2;
+}
+function calculateTradingMultiples({ peerPE, peerEVFCF, targetEPS, targetFCF, targetNetDebt, sharesOut }) {
+  const impliedPrice_PE = peerPE != null && targetEPS != null ? peerPE * targetEPS : null;
+  const impliedEV_EVFCF = peerEVFCF != null && targetFCF != null ? peerEVFCF * targetFCF : null;
+  const impliedEquity_EVFCF = impliedEV_EVFCF != null ? impliedEV_EVFCF - targetNetDebt : null;
+  const impliedPrice_EVFCF = impliedEquity_EVFCF != null && sharesOut > 0 ? impliedEquity_EVFCF / sharesOut : null;
+  return { impliedPrice_PE, impliedEV_EVFCF, impliedEquity_EVFCF, impliedPrice_EVFCF };
+}
+
+// --- Precedent Transactions — illustrative placeholder, not a real deals database (disclosed in-UI) ---
+const MOCK_PRECEDENT_DEALS = [
+  { name:"Illustrative Deal A (large-cap strategic)", evFcfMultiple:24.0, premium:0.32 },
+  { name:"Illustrative Deal B (mid-cap strategic)",    evFcfMultiple:19.5, premium:0.28 },
+  { name:"Illustrative Deal C (sponsor/PE buyout)",    evFcfMultiple:16.0, premium:0.24 },
+];
+function calculatePrecedentTransactions({ deals, targetFCF, targetNetDebt, sharesOut }) {
+  return deals.map((d) => {
+    const impliedEV = d.evFcfMultiple * targetFCF;
+    const impliedEquity = impliedEV - targetNetDebt;
+    const impliedPrice = sharesOut > 0 ? impliedEquity / sharesOut : null;
+    return { ...d, impliedEV, impliedEquity, impliedPrice };
+  });
+}
+
+// --- LBO ---
+function calculateLBO({ entryFCF, entryMultiple, leverageMultiple, interestRate, holdYears = 5, exitMultiple, fcfGrowth, fcfSweepPct = 0.75 }) {
+  const entryEV = entryMultiple * entryFCF;
+  let debt = Math.min(leverageMultiple * entryFCF, entryEV * 0.85); // guardrail: cap leverage at 85% of EV
+  const entryDebt = debt;
+  const entryEquity = entryEV - entryDebt;
+  let fcf = entryFCF;
+  const schedule = [];
+  for (let y = 1; y <= holdYears; y++) {
+    fcf = fcf * (1 + fcfGrowth);
+    const interest = debt * interestRate;
+    const cashAvailable = Math.max(0, fcf - interest);
+    const paydown = Math.min(debt, cashAvailable * fcfSweepPct);
+    debt -= paydown;
+    schedule.push({ year: y, fcf, interest, paydown, endingDebt: debt });
+  }
+  const exitFCF = fcf;
+  const exitEV = exitMultiple * exitFCF;
+  const exitDebt = debt;
+  const exitEquity = exitEV - exitDebt;
+  const moic = entryEquity > 0 ? exitEquity / entryEquity : null;
+  const irr = moic != null && moic > 0 ? Math.pow(moic, 1 / holdYears) - 1 : null;
+  return { entryEV, entryDebt, entryEquity, schedule, exitFCF, exitEV, exitDebt, exitEquity, moic, irr };
+}
+
+// --- Derived per-ticker fields (approximations — see skill doc) ---
+// Shares outstanding in BILLIONS (marketCap and price are both raw dollars;
+// fcf/netDebt are in $B throughout this engine, so this stays unit-consistent
+// with everything it gets divided into — see calculateDCF/TradingMultiples).
+// Prefers the real SEC EDGAR figure (sharesOutB, from
+// dei:EntityCommonStockSharesOutstanding) once a Fundamentals pull has
+// landed for this ticker; otherwise derives it from marketCap/price.
+function impliedSharesOut(t){
+  const u=UNIVERSE[t];
+  if(u && u.sharesOutB!=null) return u.sharesOutB;
+  return (u && u.marketCap && u.price) ? (u.marketCap/u.price)/1e9 : null;
+}
+// Net debt in $B. Real figure once a SEC EDGAR "Pull Fundamentals" run has
+// populated netDebtB (fundamentalsSource==="sec-edgar"); otherwise falls back
+// to the illustrative MOCK_NET_DEBT_B seed. Never derived from
+// debtEquity x marketCap (see the comment on MOCK_NET_DEBT_B for why that
+// combination is unsound). Falls back to 0 if neither is present (e.g. a
+// newly imported ticker) rather than guessing.
+function impliedNetDebt(t){ const u=UNIVERSE[t]; return (u && u.netDebtB!=null) ? u.netDebtB : 0; }
+// Real EBITDA in $B from SEC EDGAR (Operating Income + D&A, both XBRL-tagged)
+// — null unless a Fundamentals pull has resolved both components for this
+// ticker. Used to upgrade Trading Multiples from the EV/FCF stand-in to a
+// true EV/EBITDA basis; DCF/LBO stay FCF-based regardless (FCF is the one
+// figure guaranteed present in both mock and real data).
+function impliedEBITDA(t){ const u=UNIVERSE[t]; return u && u.ebitdaB!=null ? u.ebitdaB : null; }
+function impliedEPS(t){ const u=UNIVERSE[t]; return u ? (u.eps || (u.pe ? u.price/u.pe : null)) : null; }
+// FCF base for DCF/LBO/Multiples-fallback. Alpha Vantage's live "Full"
+// refresh never populates fcf (needs CASH_FLOW, not wired in — same
+// disclosed gap as debtEquity, see README) — so a ticker refreshed live via
+// Alpha Vantage has NO usable fcf even though it has real price/marketCap
+// data. If a SEC EDGAR Fundamentals pull has landed real EBITDA for this
+// ticker, use that as a proxy (haircut for capex/taxes/working capital —
+// clearly flagged via .approximated, never silently swapped in). Returns
+// {value, approximated} rather than a bare number so callers can disclose it.
+function impliedFCFBase(t){
+  const u = UNIVERSE[t];
+  if(!u) return { value:null, approximated:false };
+  if(u.fcf!=null) return { value:u.fcf, approximated:false };
+  if(u.ebitdaB!=null) return { value:u.ebitdaB*0.7, approximated:true }; // ~70% of EBITDA, standard rough FCF conversion rule-of-thumb
+  return { value:null, approximated:false };
+}
+
+// --- Per-ticker assumption defaults + accessor (lazily populated into state.valuationAssumptions) ---
+function defaultValuationAssumptions(t){
+  const u = UNIVERSE[t];
+  const beta = STOCK_BETA[t] ?? u.beta ?? 1;
+  const debtWeight = u.debtEquity!=null ? u.debtEquity/(1+u.debtEquity) : 0.2;
+  return {
+    dcf: {
+      nearTermGrowth: u.revGrowth!=null ? Math.min(u.revGrowth,0.35) : 0.08,
+      terminalGrowth: 0.025,
+      years: 5,
+      waccMode: "capm", // "manual" | "capm"
+      waccManual: 0.09,
+      capm: { rf: RF, beta: Number(beta.toFixed(2)), erp: 0.055, kd: 0.05, tax: 0.21, debtWeight: Number(debtWeight.toFixed(2)) },
+    },
+    multiples: {
+      peerSet: TICKERS.filter(x=>x!==t && UNIVERSE[x].assetClass!=="ETF" && UNIVERSE[x].group===u.group).slice(0,5),
+    },
+    lbo: {
+      entryMultiple: 12,
+      leverageMultiple: 5,
+      interestRate: 0.08,
+      holdYears: 5,
+      exitMultiple: 12,
+      fcfGrowth: u.revGrowth!=null ? Math.min(u.revGrowth,0.25) : 0.06,
+      fcfSweepPct: 0.75,
+    },
+    precedent: {
+      deals: MOCK_PRECEDENT_DEALS.map(d=>({...d})),
+    },
+  };
+}
+function getVA(t){
+  if(!state.valuationAssumptions[t]) state.valuationAssumptions[t] = defaultValuationAssumptions(t);
+  return state.valuationAssumptions[t];
+}
+function resolvedWACC(t){
+  const d = getVA(t).dcf;
+  if(d.waccMode==="manual") return d.waccManual;
+  return calculateWACC({ rf:d.capm.rf, beta:d.capm.beta, erp:d.capm.erp, costOfDebtPretax:d.capm.kd, taxRate:d.capm.tax, debtWeight:d.capm.debtWeight }).wacc;
+}
+// Generic nested-path setter for assumption edits, e.g. setVAField("NVDA","dcf.capm.beta",1.1)
+function setVAField(t, path, value){
+  const va = getVA(t);
+  const parts = path.split(".");
+  let obj = va;
+  for(let i=0;i<parts.length-1;i++) obj = obj[parts[i]];
+  obj[parts[parts.length-1]] = value;
+}
+
+/* =========================================================================
    FORMATTERS
    ========================================================================= */
 // HTML-escape any string before it goes into an innerHTML template literal.
@@ -863,12 +1102,15 @@ function tagClass(tag){
 /* =========================================================================
    APP STATE
    ========================================================================= */
-const VIEWS=[["dashboard","Dashboard"],["detail","Stock Detail"],["portfolio","Portfolio & Risk"],["screener","Screener"],["comparison","Comparison"]];
+const VIEWS=[["dashboard","Dashboard"],["detail","Stock Detail"],["portfolio","Portfolio & Risk"],["screener","Screener"],["comparison","Comparison"],["valuation","Valuation"],["marketpulse","Market Pulse"]];
 let state = {
   view:"dashboard",
   portfolio: { ...INITIAL_PORTFOLIO },
   selectedTicker:"NVDA",
   comparisonSet:["NVDA","MSFT","GOOGL","JPM"],
+  valuationTicker:"NVDA",
+  valuationMethod:"dcf",       // dcf | multiples | precedent | lbo
+  valuationAssumptions:{},     // ticker -> { dcf:{...}, multiples:{...}, lbo:{...}, precedent:{...} }, lazily populated
   searchQuery:"",
   modalOpen:false,
   modalQuery:"",
@@ -887,6 +1129,7 @@ let state = {
 };
 const DIVIDENDS = {};      // ticker -> { history:[{exDate,payDate,amount}], lastRefreshed }
 const NEWS_SENTIMENT = {}; // ticker -> { avgScore, articleCount, headlines:[...], lastRefreshed }
+let MARKET_PULSE = null;   // { vixy:{series,price,lastRefreshed}, putCall:{ratioFullChain,byExpiration,lastRefreshed}, dataSource, lastRefreshed }
 let chartRegistry={};
 function destroyCharts(){ Object.values(chartRegistry).forEach(c=>c&&c.destroy()); chartRegistry={}; }
 let MC_CACHE = null; // cached Monte Carlo fan series, keyed by a totalValue/annReturn/annVol signature
@@ -962,6 +1205,8 @@ function render(){
   if(state.view==="portfolio") root.innerHTML=viewPortfolio();
   if(state.view==="screener") root.innerHTML=viewScreener();
   if(state.view==="comparison") root.innerHTML=viewComparison();
+  if(state.view==="valuation") root.innerHTML=viewValuation();
+  if(state.view==="marketpulse") root.innerHTML=viewMarketPulse();
   renderModal(); renderRefreshModal(); renderImportModal();
   attachHandlers();
   drawCharts();
@@ -1143,13 +1388,17 @@ function viewDetail(ticker){
         <div class="stat-card"><div class="stat-label">Div. Yield</div><div class="stat-value small">${s.divYield?fmtPlain(s.divYield):"—"}</div><div class="stat-sub">${s.expRatio?`exp. ratio ${(s.expRatio*100).toFixed(2)}%`:"annual"}</div></div>
         <div class="stat-card"><div class="stat-label">Debt/Equity</div><div class="stat-value small">${s.debtEquity ?? "—"}</div><div class="stat-sub">${s.dataSource==="live"?"needs BALANCE_SHEET call — not pulled":"latest FY (mock)"}</div></div>
         <div class="stat-card"><div class="stat-label">ROE</div><div class="stat-value small">${s.roe?fmtPlain(s.roe):"—"}</div><div class="stat-sub">trailing 12mo</div></div>
-        <div class="stat-card"><div class="stat-label">Revenue Growth</div><div class="stat-value small">${s.revGrowth?fmtPlain(s.revGrowth):"—"}</div><div class="stat-sub">YoY</div></div>
-        <div class="stat-card"><div class="stat-label">EBITDA Margin</div><div class="stat-value small">${s.ebitdaMargin?fmtPlain(s.ebitdaMargin):"—"}</div><div class="stat-sub">latest FY</div></div>
+        <div class="stat-card"><div class="stat-label">Revenue Growth</div><div class="stat-value small">${s.revGrowth?fmtPlain(s.revGrowth):"—"}</div><div class="stat-sub">${s.revGrowthSource==="sec-edgar"?`EDGAR YoY, as of ${escapeHtml(s.fundamentalsAsOf||"—")}`:"YoY (mock)"}</div></div>
+        <div class="stat-card"><div class="stat-label">EBITDA Margin</div><div class="stat-value small">${s.ebitdaMargin?fmtPlain(s.ebitdaMargin):"—"}</div><div class="stat-sub">${s.ebitdaMarginSource==="sec-edgar"?`EDGAR, as of ${escapeHtml(s.fundamentalsAsOf||"—")}`:"latest FY (mock)"}</div></div>
         <div class="stat-card"><div class="stat-label">Free Cash Flow</div><div class="stat-value small">${s.fcf?fmtMoneyB(s.fcf):"—"}</div><div class="stat-sub">${s.dataSource==="live"?"needs CASH_FLOW call — not pulled":"TTM (mock)"}</div></div>
         <div class="stat-card"><div class="stat-label">Avg Daily Volume</div><div class="stat-value small">${fmtNum(s.avgVolume,1)}M</div><div class="stat-sub">${escapeHtml(s.assetClass)} · ${escapeHtml(s.sector)||"—"}</div></div>
+        <div class="stat-card"><div class="stat-label">Revenue</div><div class="stat-value small">${s.revenueB!=null?fmtMoneyB(s.revenueB):"—"}</div><div class="stat-sub">${s.fundamentalsSource==="sec-edgar"?`EDGAR, as of ${escapeHtml(s.fundamentalsAsOf||"—")}`:"run Pull Fundamentals (SEC EDGAR)"}</div></div>
+        <div class="stat-card"><div class="stat-label">EBITDA</div><div class="stat-value small">${s.ebitdaB!=null?fmtMoneyB(s.ebitdaB):"—"}</div><div class="stat-sub">${s.fundamentalsSource==="sec-edgar"?`EDGAR approx., as of ${escapeHtml(s.fundamentalsAsOf||"—")}`:"run Pull Fundamentals (SEC EDGAR)"}</div></div>
+        <div class="stat-card"><div class="stat-label">Net Debt</div><div class="stat-value small">${s.netDebtB!=null?fmtMoneyB(s.netDebtB):"—"}</div><div class="stat-sub">${s.fundamentalsSource==="sec-edgar"?`EDGAR, as of ${escapeHtml(s.fundamentalsAsOf||"—")}`:"run Pull Fundamentals (SEC EDGAR)"}</div></div>
+        <div class="stat-card"><div class="stat-label">Shares Out</div><div class="stat-value small">${s.sharesOutB!=null?fmtNum(s.sharesOutB,2)+"B":"—"}</div><div class="stat-sub">${s.fundamentalsSource==="sec-edgar"?`EDGAR, as of ${escapeHtml(s.fundamentalsAsOf||"—")}`:"run Pull Fundamentals (SEC EDGAR)"}</div></div>
       </div>
     </div>
-    <div class="footnote">Jump to any ticker via the search bar on Dashboard, the selector above, the Screener, or a row in Portfolio &amp; Risk / Comparison. P/E percentile compares current P/E to a ${s.dataSource==="live"?"same-EPS implied historical series (real prices, approximated constant EPS)":"same-EPS implied historical series (mock)"} — see the technical-indicators skill for the real EARNINGS-based upgrade path.</div>
+    <div class="footnote">Jump to any ticker via the search bar on Dashboard, the selector above, the Screener, or a row in Portfolio &amp; Risk / Comparison. P/E percentile compares current P/E to a ${s.dataSource==="live"?"same-EPS implied historical series (real prices, approximated constant EPS)":"same-EPS implied historical series (mock)"} — see the technical-indicators skill for the real EARNINGS-based upgrade path. Revenue/EBITDA/Net Debt/Shares Out come from the SEC EDGAR "Pull Fundamentals" refresh (see Refresh Data), independent of the Alpha Vantage price/quote refresh.</div>
   </div>`;
 }
 
@@ -1482,6 +1731,233 @@ function viewComparison(){
 }
 
 /* =========================================================================
+   VIEW: VALUATION — DCF, Trading Multiples, Precedent Transactions, LBO
+   Formulas: equitylens-valuation skill. See its data-model-gap note for why
+   EV/FCF stands in for EV/EBITDA and net debt is approximated throughout.
+   ========================================================================= */
+function viewValuation(){
+  const t = state.valuationTicker;
+  const u = UNIVERSE[t];
+  const method = state.valuationMethod;
+  const equityTickers = TICKERS.filter(x=>UNIVERSE[x].assetClass!=="ETF");
+  const methodTabs = [["dcf","DCF"],["multiples","Trading Multiples"],["precedent","Precedent Transactions"],["lbo","LBO"]];
+
+  let body = "";
+  const fcfBase = u ? impliedFCFBase(t) : { value:null, approximated:false };
+  if(!u || u.assetClass==="ETF"){
+    body = `<div class="warn-box">ETFs don't have a standalone DCF/comps/LBO valuation — pick a single-name equity from the selector above.</div>`;
+  } else if(u.marketCap==null || fcfBase.value==null){
+    body = `<div class="warn-box">${t} is missing market cap or a usable FCF/EBITDA figure (data source: ${u.dataSource||"pending"}) — run a Full refresh (Alpha Vantage) for market cap, or Pull Fundamentals (SEC EDGAR) for EBITDA, before valuing it.</div>`;
+  } else {
+    const va = getVA(t);
+    const eps = impliedEPS(t);
+    const netDebt = impliedNetDebt(t);
+    const sharesOut = impliedSharesOut(t);
+    const fcfNote = fcfBase.approximated ? `<div class="warn-box">FCF isn't available for ${t} (Alpha Vantage's live refresh doesn't pull it — needs CASH_FLOW, not wired in). Using ~70% of real SEC EDGAR EBITDA as a rough stand-in instead — a standard rule-of-thumb conversion, not real FCF. Treat outputs below as more approximate than usual.</div>` : "";
+    if(method==="dcf") body = fcfNote + renderDCFPanel(t, u, va, fcfBase);
+    else if(method==="multiples") body = renderMultiplesPanel(t, u, va, eps, netDebt, sharesOut, equityTickers, fcfBase);
+    else if(method==="lbo") body = fcfNote + renderLBOPanel(t, u, va, fcfBase);
+    else if(method==="precedent") body = fcfNote + renderPrecedentPanel(va, netDebt, sharesOut, fcfBase);
+  }
+
+  const hasRealFundamentals = !!(u && u.fundamentalsSource==="sec-edgar");
+  return `
+  <div class="topbar">
+    <div>
+      <div class="page-heading">Valuation ${u && u.assetClass!=="ETF" ? `<span class="src-pill ${hasRealFundamentals?'live':'mock'}" title="${hasRealFundamentals?`Real fundamentals from SEC EDGAR${u.fundamentalsAsOf?`, as of ${escapeHtml(u.fundamentalsAsOf)}`:''}`:'Illustrative mock fundamentals — run Refresh Data → Pull Fundamentals for real figures'}">${hasRealFundamentals?'EDGAR':'illustrative'}</span>` : ""}</div>
+      <div class="page-sub">DCF · Trading Multiples · Precedent Transactions · LBO — one consistent FCF-based data model across all four</div>
+    </div>
+    <select id="valuationSelect" class="mono" style="padding:8px 10px;border:1px solid var(--border);border-radius:7px;background:var(--surface);">
+      ${equityTickers.map(x=>`<option value="${x}" ${x===t?'selected':''}>${x} — ${escapeHtml(UNIVERSE[x].name)}</option>`).join("")}
+    </select>
+  </div>
+  <div class="content">
+    <div class="chip-row">
+      ${methodTabs.map(([k,l])=>`<div class="chip ${method===k?'chip-active':''}" data-vmethod="${k}">${l}</div>`).join("")}
+    </div>
+    ${body}
+    <div class="footnote">${hasRealFundamentals
+      ? `Net debt, EBITDA, and shares outstanding for ${t} are real figures from SEC EDGAR (Refresh Data → Pull Fundamentals)${u.fundamentalsAsOf?`, as of ${escapeHtml(u.fundamentalsAsOf)} (${escapeHtml(u.fundamentalsForm||"a filing")})`:""}. Full formula reference: equitylens-valuation skill.`
+      : `Every method here runs off FCF and market cap (already in the data model) rather than revenue/EBITDA in dollars — EV/EBITDA-style multiples are approximated as EV/FCF instead, and net debt is an illustrative mock figure (MOCK_NET_DEBT_B). Run Refresh Data → Pull Fundamentals (free, SEC EDGAR, no daily cap) to replace these with real figures for ${t}. Full formula reference and live-data upgrade path: equitylens-valuation skill.`}</div>
+  </div>`;
+}
+
+function renderDCFPanel(t, u, va, fcfBaseObj){
+  const fcfBase = fcfBaseObj.value;
+  const d = va.dcf;
+  const wacc = resolvedWACC(t);
+  const waccInfo = d.waccMode==="capm" ? calculateWACC({ rf:d.capm.rf, beta:d.capm.beta, erp:d.capm.erp, costOfDebtPretax:d.capm.kd, taxRate:d.capm.tax, debtWeight:d.capm.debtWeight }) : null;
+  const validWacc = wacc!=null && wacc>d.terminalGrowth;
+  const netDebt = impliedNetDebt(t), sharesOut = impliedSharesOut(t);
+  const result = validWacc ? calculateDCF({ fcfBase, nearTermGrowth:d.nearTermGrowth, terminalGrowth:d.terminalGrowth, years:d.years, wacc, netDebt, sharesOut }) : null;
+  const grid = validWacc ? dcfSensitivity({ fcfBase, nearTermGrowth:d.nearTermGrowth, terminalGrowth:d.terminalGrowth, years:d.years, wacc, netDebt, sharesOut }) : null;
+  const upside = result && result.impliedSharePrice!=null ? (result.impliedSharePrice-u.price)/u.price : null;
+
+  return `
+  <div class="detail-grid">
+    <div class="table-card" style="padding:20px;">
+      <div class="section-label">Assumptions</div>
+      <div class="val-form">
+        <div class="val-row"><label>Near-term FCF growth (Yr 1)</label><span class="val-pct">% <input class="val-input" type="number" step="0.5" data-vfield="dcf.nearTermGrowth" data-vunit="pct" value="${(d.nearTermGrowth*100).toFixed(1)}"></span></div>
+        <div class="val-row"><label>Terminal growth</label><span class="val-pct">% <input class="val-input" type="number" step="0.25" data-vfield="dcf.terminalGrowth" data-vunit="pct" value="${(d.terminalGrowth*100).toFixed(2)}"></span></div>
+        <div class="val-row"><label>Projection years</label><input class="val-input" type="number" step="1" min="3" max="10" data-vfield="dcf.years" value="${d.years}"></div>
+        <div class="val-row"><label>Starting FCF (base year)</label><span class="mono">${fmtMoneyB(fcfBase)}</span></div>
+        <div class="val-divider"></div>
+        <div class="section-label" style="margin-bottom:2px;">Discount Rate (WACC)</div>
+        <div class="radio-row">
+          <div class="radio-opt ${d.waccMode==='manual'?'selected':''}" data-vwaccmode="manual">I'll enter my own WACC</div>
+          <div class="radio-opt ${d.waccMode==='capm'?'selected':''}" data-vwaccmode="capm">Help me calculate it (CAPM)</div>
+        </div>
+        ${d.waccMode==="manual" ? `
+        <div class="val-row"><label>WACC</label><span class="val-pct">% <input class="val-input" type="number" step="0.1" data-vfield="dcf.waccManual" data-vunit="pct" value="${(d.waccManual*100).toFixed(1)}"></span></div>
+        ` : `
+        <div class="val-row"><label>Risk-free rate</label><span class="val-pct">% <input class="val-input" type="number" step="0.1" data-vfield="dcf.capm.rf" data-vunit="pct" value="${(d.capm.rf*100).toFixed(1)}"></span></div>
+        <div class="val-row"><label>Beta</label><input class="val-input" type="number" step="0.05" data-vfield="dcf.capm.beta" value="${d.capm.beta.toFixed(2)}"></div>
+        <div class="val-row"><label>Equity risk premium</label><span class="val-pct">% <input class="val-input" type="number" step="0.1" data-vfield="dcf.capm.erp" data-vunit="pct" value="${(d.capm.erp*100).toFixed(1)}"></span></div>
+        <div class="val-row"><label>Pre-tax cost of debt</label><span class="val-pct">% <input class="val-input" type="number" step="0.1" data-vfield="dcf.capm.kd" data-vunit="pct" value="${(d.capm.kd*100).toFixed(1)}"></span></div>
+        <div class="val-row"><label>Tax rate</label><span class="val-pct">% <input class="val-input" type="number" step="1" data-vfield="dcf.capm.tax" data-vunit="pct" value="${(d.capm.tax*100).toFixed(1)}"></span></div>
+        <div class="val-row"><label>Debt weight, D/(D+E)</label><span class="val-pct">% <input class="val-input" type="number" step="1" data-vfield="dcf.capm.debtWeight" data-vunit="pct" value="${(d.capm.debtWeight*100).toFixed(1)}"></span></div>
+        <div class="val-divider"></div>
+        <div class="val-row"><label>Cost of equity</label><span class="mono">${fmtPlain(waccInfo.costOfEquity)}</span></div>
+        <div class="val-row"><label>After-tax cost of debt</label><span class="mono">${fmtPlain(waccInfo.costOfDebtAfterTax)}</span></div>
+        `}
+        <div class="val-row" style="border-top:1px solid var(--border);padding-top:8px;margin-top:2px;"><label style="font-weight:600;color:var(--text);">WACC used in DCF</label><span class="mono" style="font-weight:700;">${wacc!=null?fmtPlain(wacc):"—"}</span></div>
+        ${!validWacc?`<div class="warn-box">WACC must be greater than the terminal growth rate, or the terminal value is undefined — adjust one of the two above.</div>`:""}
+      </div>
+    </div>
+    <div class="table-card" style="padding:20px;">
+      <div class="section-label">Implied Value</div>
+      ${result ? `
+      <div style="display:flex;align-items:baseline;gap:12px;margin-bottom:2px;">
+        <div class="val-output-big">$${result.impliedSharePrice.toFixed(2)}</div>
+        <div class="mono ${cls(upside)}" style="font-size:13px;">${arrow(upside)} ${fmtPct(Math.abs(upside))} vs. current $${u.price.toFixed(2)}</div>
+      </div>
+      <div class="stat-sub" style="margin-bottom:14px;">Implied share price</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;font-size:12px;">
+        <div><div class="stat-label">Enterprise Value</div><div class="stat-value small">${fmtMoneyB(result.enterpriseValue)}</div></div>
+        <div><div class="stat-label">Equity Value</div><div class="stat-value small">${fmtMoneyB(result.equityValue)}</div></div>
+        <div><div class="stat-label">PV of Terminal Value</div><div class="stat-value small">${fmtMoneyB(result.pvTerminalValue)}</div></div>
+        <div><div class="stat-label">TV % of EV</div><div class="stat-value small">${fmtPlain(result.pvOfTerminalPct)}</div></div>
+      </div>
+      <div class="section-label" style="margin-top:16px;">FCF Projection</div>
+      <table><thead><tr><th>Year</th><th class="num">Growth</th><th class="num">FCF</th><th class="num">PV</th></tr></thead>
+      <tbody>${result.rows.map(r=>`<tr><td>${r.year}</td><td class="num">${fmtPlain(r.growth)}</td><td class="num">${fmtMoneyB(r.fcf)}</td><td class="num">${fmtMoneyB(r.pv)}</td></tr>`).join("")}</tbody></table>
+      <div class="section-label" style="margin-top:16px;">Sensitivity — Implied Share Price (WACC × Terminal Growth)</div>
+      <table><thead><tr><th></th>${[d.terminalGrowth-0.005,d.terminalGrowth,d.terminalGrowth+0.005].map(tg=>`<th class="num">g=${fmtPlain(tg,2)}</th>`).join("")}</tr></thead>
+      <tbody>${[wacc-0.01,wacc,wacc+0.01].map((w,i)=>`<tr><td class="mono">WACC ${fmtPlain(w)}</td>${grid[i].map(v=>`<td class="num">${v!=null?"$"+v.toFixed(2):"—"}</td>`).join("")}</tr>`).join("")}</tbody></table>
+      ` : `<div class="warn-box">Fix the WACC/terminal growth relationship above to see implied value.</div>`}
+    </div>
+  </div>`;
+}
+
+function renderMultiplesPanel(t, u, va, eps, netDebt, sharesOut, equityTickers, fcfBaseObj){
+  const peers = va.multiples.peerSet.filter(x=>x!==t && UNIVERSE[x]);
+  // Use a true EV/EBITDA basis once the TARGET has real SEC EDGAR EBITDA —
+  // otherwise the whole table stays on the universally-available EV/FCF
+  // stand-in. Deliberately a single basis for the whole comparison (not
+  // per-peer) so the peer median isn't averaging EV/EBITDA against EV/FCF
+  // for different peers, which wouldn't be a coherent multiple.
+  const useEbitda = impliedEBITDA(t)!=null;
+  const targetBasis = useEbitda ? impliedEBITDA(t) : fcfBaseObj.value;
+  const basisLabel = useEbitda ? "EBITDA" : "FCF*";
+  const peerRows = peers.map(x=>{
+    const pu = UNIVERSE[x];
+    const pNetDebt = impliedNetDebt(x); // $B
+    const pMarketCapB = pu.marketCap!=null ? pu.marketCap/1e9 : null; // marketCap is raw $, convert to $B to match FCF/netDebt/EBITDA units
+    const pBasis = useEbitda ? impliedEBITDA(x) : impliedFCFBase(x).value;
+    const evMultiple = (pMarketCapB!=null && pBasis) ? (pMarketCapB+pNetDebt)/pBasis : null;
+    return { ticker:x, pe:pu.pe, evMultiple, missingBasis: useEbitda && impliedEBITDA(x)==null };
+  });
+  const peerPE = peerMedian(peerRows.map(r=>r.pe));
+  const peerEVMultiple = peerMedian(peerRows.map(r=>r.evMultiple));
+  const result = calculateTradingMultiples({ peerPE, peerEVFCF:peerEVMultiple, targetEPS:eps, targetFCF:targetBasis, targetNetDebt:netDebt, sharesOut });
+  const upsidePE = result.impliedPrice_PE!=null ? (result.impliedPrice_PE-u.price)/u.price : null;
+  const upsideEVFCF = result.impliedPrice_EVFCF!=null ? (result.impliedPrice_EVFCF-u.price)/u.price : null;
+
+  return `
+  <div>
+    <div class="section-label">Peer Set <span style="font-weight:400;font-style:italic;color:var(--muted);text-transform:none;letter-spacing:0;">— click to add/remove</span></div>
+    <div class="chip-row">${equityTickers.filter(x=>x!==t).map(x=>`<div class="chip ${va.multiples.peerSet.includes(x)?'chip-active':''}" data-vpeer="${x}">${x}</div>`).join("")}</div>
+  </div>
+  <div class="detail-grid">
+    <div class="table-card">
+      <table><thead><tr><th>Ticker</th><th class="num">P/E</th><th class="num">EV / ${basisLabel}</th></tr></thead>
+      <tbody>
+      ${peerRows.length===0?`<tr><td colspan="3" style="padding:16px;color:var(--muted);">Select at least one peer above.</td></tr>`:peerRows.map(r=>`<tr><td class="name-cell"><span class="ticker-tag">${r.ticker}</span></td><td class="num">${fmtNum(r.pe,1)}</td><td class="num">${r.missingBasis?`<span style="color:var(--muted);font-style:italic;">no EBITDA yet</span>`:fmtNum(r.evMultiple,1)}</td></tr>`).join("")}
+      <tr style="font-weight:600;background:var(--surface-2);"><td>Peer median</td><td class="num">${fmtNum(peerPE,1)}</td><td class="num">${fmtNum(peerEVMultiple,1)}</td></tr>
+      </tbody></table>
+    </div>
+    <div class="table-card" style="padding:20px;">
+      <div class="section-label">Implied Value — ${t} <span class="src-pill ${useEbitda?'live':'mock'}">${useEbitda?'EDGAR':'FCF stand-in'}</span></div>
+      <div style="display:flex;flex-direction:column;gap:14px;">
+        <div>
+          <div class="stat-label">Peer median P/E × ${t} EPS (${fmtNum(eps,2)})</div>
+          <div style="display:flex;align-items:baseline;gap:10px;"><div class="val-output-big">${result.impliedPrice_PE!=null?"$"+result.impliedPrice_PE.toFixed(2):"—"}</div>${upsidePE!=null?`<span class="mono ${cls(upsidePE)}">${arrow(upsidePE)} ${fmtPct(Math.abs(upsidePE))}</span>`:""}</div>
+        </div>
+        <div style="border-top:1px solid var(--border);padding-top:12px;">
+          <div class="stat-label">Peer median EV/${basisLabel} × ${t} ${basisLabel} (${fmtMoneyB(targetBasis)})</div>
+          <div style="display:flex;align-items:baseline;gap:10px;"><div class="val-output-big">${result.impliedPrice_EVFCF!=null?"$"+result.impliedPrice_EVFCF.toFixed(2):"—"}</div>${upsideEVFCF!=null?`<span class="mono ${cls(upsideEVFCF)}">${arrow(upsideEVFCF)} ${fmtPct(Math.abs(upsideEVFCF))}</span>`:""}</div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="footnote">${useEbitda
+    ? `EV/EBITDA is computed from real SEC EDGAR fundamentals for ${t} (Operating Income + D&A). Peers marked "no EBITDA yet" haven't had a Fundamentals pull run for them, so they're excluded from the median rather than mixed in on a different basis (FCF) — run Pull Fundamentals on more peers to include them.`
+    : `*EV/FCF stands in for EV/EBITDA — ${t} doesn't have real EBITDA yet (Refresh Data → Pull Fundamentals to get it from SEC EDGAR). FCF is a cash-flow-based multiple too, so the substitution is directionally consistent, not a perfect match.`}</div>`;
+}
+
+function renderLBOPanel(t, u, va, fcfBaseObj){
+  const l = va.lbo;
+  const result = calculateLBO({ entryFCF:fcfBaseObj.value, entryMultiple:l.entryMultiple, leverageMultiple:l.leverageMultiple, interestRate:l.interestRate, holdYears:l.holdYears, exitMultiple:l.exitMultiple, fcfGrowth:l.fcfGrowth, fcfSweepPct:l.fcfSweepPct });
+  return `
+  <div class="detail-grid">
+    <div class="table-card" style="padding:20px;">
+      <div class="section-label">Deal Assumptions</div>
+      <div class="val-form">
+        <div class="val-row"><label>Entry multiple (x FCF)</label><input class="val-input" type="number" step="0.5" data-vfield="lbo.entryMultiple" value="${l.entryMultiple}"></div>
+        <div class="val-row"><label>Leverage (Debt / FCF)</label><input class="val-input" type="number" step="0.5" data-vfield="lbo.leverageMultiple" value="${l.leverageMultiple}"></div>
+        <div class="val-row"><label>Interest rate on debt</label><span class="val-pct">% <input class="val-input" type="number" step="0.25" data-vfield="lbo.interestRate" data-vunit="pct" value="${(l.interestRate*100).toFixed(2)}"></span></div>
+        <div class="val-row"><label>FCF growth (annual)</label><span class="val-pct">% <input class="val-input" type="number" step="0.5" data-vfield="lbo.fcfGrowth" data-vunit="pct" value="${(l.fcfGrowth*100).toFixed(1)}"></span></div>
+        <div class="val-row"><label>FCF swept to debt paydown</label><span class="val-pct">% <input class="val-input" type="number" step="5" data-vfield="lbo.fcfSweepPct" data-vunit="pct" value="${(l.fcfSweepPct*100).toFixed(0)}"></span></div>
+        <div class="val-row"><label>Hold period (years)</label><input class="val-input" type="number" step="1" min="1" max="10" data-vfield="lbo.holdYears" value="${l.holdYears}"></div>
+        <div class="val-row"><label>Exit multiple (x FCF)</label><input class="val-input" type="number" step="0.5" data-vfield="lbo.exitMultiple" value="${l.exitMultiple}"></div>
+      </div>
+    </div>
+    <div class="table-card" style="padding:20px;">
+      <div class="section-label">Returns</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px;">
+        <div><div class="stat-label">Entry EV</div><div class="stat-value small">${fmtMoneyB(result.entryEV)}</div></div>
+        <div><div class="stat-label">Entry Debt / Equity Check</div><div class="stat-value small">${fmtMoneyB(result.entryDebt)} / ${fmtMoneyB(result.entryEquity)}</div></div>
+        <div><div class="stat-label">Exit EV</div><div class="stat-value small">${fmtMoneyB(result.exitEV)}</div></div>
+        <div><div class="stat-label">Exit Debt / Equity</div><div class="stat-value small">${fmtMoneyB(result.exitDebt)} / ${fmtMoneyB(result.exitEquity)}</div></div>
+      </div>
+      <div style="display:flex;gap:24px;border-top:1px solid var(--border);padding-top:14px;">
+        <div><div class="stat-label">MOIC</div><div class="val-output-big">${result.moic!=null?result.moic.toFixed(2)+"x":"—"}</div></div>
+        <div><div class="stat-label">IRR</div><div class="val-output-big">${result.irr!=null?fmtPlain(result.irr):"—"}</div></div>
+      </div>
+      <div class="section-label" style="margin-top:16px;">Debt Paydown Schedule</div>
+      <table><thead><tr><th>Year</th><th class="num">FCF</th><th class="num">Interest</th><th class="num">Paydown</th><th class="num">Ending Debt</th></tr></thead>
+      <tbody>${result.schedule.map(r=>`<tr><td>${r.year}</td><td class="num">${fmtMoneyB(r.fcf)}</td><td class="num">${fmtMoneyB(r.interest)}</td><td class="num">${fmtMoneyB(r.paydown)}</td><td class="num">${fmtMoneyB(r.endingDebt)}</td></tr>`).join("")}</tbody></table>
+    </div>
+  </div>
+  <div class="footnote">Entry/exit multiples are quoted against FCF, not EBITDA (see data-model note above) — a real LBO model would also size fees, a minimum cash balance, and a revolver; this is the core mechanics (leverage, cash sweep, MOIC/IRR), not a bank-grade model.</div>`;
+}
+
+function renderPrecedentPanel(va, netDebt, sharesOut, fcfBaseObj){
+  const t = state.valuationTicker;
+  const u = UNIVERSE[t];
+  const deals = calculatePrecedentTransactions({ deals:va.precedent.deals, targetFCF:fcfBaseObj.value, targetNetDebt:netDebt, sharesOut });
+  return `
+  <div class="warn-box">Illustrative only. This runs off a 3-deal placeholder set (${va.precedent.deals.map(d=>d.name).join("; ")}), not a real M&amp;A comps database — there's no live or free source of comparable deal multiples wired in yet (would need a licensed database like Refinitiv/PitchBook/Capital IQ). Swap this mock deal set for real precedent transactions before using it for anything beyond a demo.</div>
+  <div class="table-card">
+    <table><thead><tr><th>Deal</th><th class="num">EV/FCF Multiple</th><th class="num">Control Premium</th><th class="num">Implied EV</th><th class="num">Implied Equity</th><th class="num">Implied Price</th></tr></thead>
+    <tbody>${deals.map(d=>`<tr><td>${escapeHtml(d.name)}</td><td class="num">${fmtNum(d.evFcfMultiple,1)}x</td><td class="num">${fmtPlain(d.premium)}</td><td class="num">${fmtMoneyB(d.impliedEV)}</td><td class="num">${fmtMoneyB(d.impliedEquity)}</td><td class="num">${d.impliedPrice!=null?"$"+d.impliedPrice.toFixed(2):"—"}</td></tr>`).join("")}</tbody>
+    </table>
+  </div>
+  <div class="footnote">Deal multiples already embed a control premium (shown alongside for reference, not multiplied in twice).</div>`;
+}
+
+/* =========================================================================
    MODAL: Add Stock
    ========================================================================= */
 function renderModal(){
@@ -1504,6 +1980,100 @@ function renderModal(){
           </div>`;
         }).join("")}
       </div>
+    </div>
+  </div>`;
+}
+
+/* =========================================================================
+   MARKET PULSE ENGINE — breadth + crowding computed live, client-side,
+   zero API cost (VIXY/put-call come from the server's Market Pulse job).
+   ========================================================================= */
+function computeMarketBreadth(){
+  const rows = TICKERS.map(t=>{
+    const pf = PRICES_FULL[t];
+    const chg = pf && pf.length>1 ? (pf[pf.length-1]-pf[pf.length-2])/pf[pf.length-2] : null;
+    return { t, trend: STOCK_TREND[t], chg };
+  });
+  const bullish = rows.filter(r=>r.trend==="Bullish").length;
+  const bearish = rows.filter(r=>r.trend==="Bearish").length;
+  const neutral = rows.length - bullish - bearish;
+  const advancers = rows.filter(r=>r.chg!=null && r.chg>0).length;
+  const decliners = rows.filter(r=>r.chg!=null && r.chg<0).length;
+  return { total: rows.length, bullish, bearish, neutral, advancers, decliners };
+}
+// Illustrative proxy only — real factor-crowding metrics need 13F positioning /
+// short-interest / ETF-flow data this app has no access to. Avg pairwise 60-day
+// return correlation across tracked EQUITIES (ETFs excluded — mixing in GLD/XLE
+// would just mechanically dilute the signal, not reflect stock-picking crowding).
+function computeCrowdingProxy(){
+  const eq = TICKERS.filter(t=>UNIVERSE[t] && UNIVERSE[t].assetClass==="Equity" && RETURNS[t] && RETURNS[t].length>5);
+  if(eq.length<2) return { avgCorr:null, n:eq.length, tier:"N/A" };
+  let sum=0, count=0;
+  for(let i=0;i<eq.length;i++){
+    for(let j=i+1;j<eq.length;j++){
+      const c = correlation(RETURNS[eq[i]], RETURNS[eq[j]]);
+      if(isFinite(c)){ sum+=c; count++; }
+    }
+  }
+  const avgCorr = count ? sum/count : null;
+  const tier = avgCorr==null ? "N/A" : avgCorr>=0.6 ? "High" : avgCorr>=0.3 ? "Moderate" : "Low";
+  return { avgCorr, n: eq.length, tier };
+}
+function crowdClass(tier){ return tier==="High" ? "bearish" : tier==="Moderate" ? "fair" : tier==="Low" ? "bullish" : "neutral"; }
+
+/* =========================================================================
+   VIEW: MARKET PULSE
+   ========================================================================= */
+function viewMarketPulse(){
+  const mp = MARKET_PULSE;
+  const vixySeries = (mp && mp.vixy && mp.vixy.series) || [];
+  const vixyPrice = mp && mp.vixy ? mp.vixy.price : null;
+  const vixyPrior5d = vixySeries.length>5 ? vixySeries[vixySeries.length-6] : null;
+  const vixyChg5d = vixyPrior5d>0 ? (vixySeries[vixySeries.length-1]-vixyPrior5d)/vixyPrior5d : null;
+  const volTrend = vixyChg5d==null ? null : vixyChg5d>0.05 ? "Rising" : vixyChg5d<-0.05 ? "Falling" : "Flat";
+
+  const pc = mp && mp.putCall ? mp.putCall.ratioFullChain : null;
+  const pcTag = pc==null ? null : pc<=0.6 ? "Bullish" : pc>=1.0 ? "Bearish" : "Neutral";
+
+  const breadth = computeMarketBreadth();
+  const breadthTag = breadth.bullish>breadth.bearish ? "Bullish" : breadth.bearish>breadth.bullish ? "Bearish" : "Neutral";
+  const crowd = computeCrowdingProxy();
+
+  return `
+  <div class="topbar">
+    <div>
+      <div class="page-heading">Market Pulse</div>
+      <div class="page-sub">Broad-market context alongside your ticker-level research${mp && mp.lastRefreshed ? ` · refreshed ${new Date(mp.lastRefreshed).toLocaleString()}` : " · not refreshed yet"}</div>
+    </div>
+  </div>
+  <div class="content">
+    <div class="summary-grid summary-grid-4">
+      <div class="stat-card">
+        <div class="stat-label">Volatility (VIXY proxy)</div>
+        <div class="stat-value small">${vixyPrice!=null ? "$"+vixyPrice.toFixed(2) : "—"}</div>
+        <div class="stat-sub">${volTrend ? `${volTrend} · ${fmtPct(vixyChg5d)} 5d` : (mp && mp.dataSource==="mock" ? "illustrative mock" : "run Refresh Data → Market Pulse")}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Put/Call Sentiment (SPY)</div>
+        <div class="stat-value small">${pc!=null ? pc.toFixed(2) : "—"}</div>
+        <div class="stat-sub">${pcTag ? `<span class="tag-pill ${tagClass(pcTag)}">${pcTag}</span>` : (mp && mp.dataSource==="mock" ? "illustrative mock" : "run Refresh Data → Market Pulse")}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Market Breadth</div>
+        <div class="stat-value small">${breadth.bullish}/${breadth.total} <span class="tag-pill ${tagClass(breadthTag)}" style="font-size:10px;">${breadthTag}</span></div>
+        <div class="stat-sub">in an uptrend · ${breadth.advancers}▲ ${breadth.decliners}▼ today</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">Factor Crowding (proxy)</div>
+        <div class="stat-value small">${crowd.avgCorr!=null ? crowd.avgCorr.toFixed(2) : "—"} ${crowd.tier!=="N/A" ? `<span class="tag-pill ${crowdClass(crowd.tier)}" style="font-size:10px;">${crowd.tier}</span>` : ""}</div>
+        <div class="stat-sub">${crowd.tier!=="N/A" ? `avg. pairwise corr., ${crowd.n} tracked equities` : "not enough tracked equities"}</div>
+      </div>
+    </div>
+    <div class="footnote" style="margin-top:14px;line-height:1.6;">
+      <b>Volatility</b>: VIXY (VIX short-term futures ETF) proxies the volatility regime — Alpha Vantage has no direct spot-VIX symbol. VIXY's price level tracks VIX <i>futures</i>, not the index itself, so read the trend/direction here, not the number as "the VIX."<br>
+      <b>Put/Call Sentiment</b>: SPY full-chain options put/call ratio, live via Alpha Vantage. ≤0.60 typically reads bullish, ≥1.00 bearish (Alpha Vantage's own stated convention).<br>
+      <b>Market Breadth</b>: computed live from your ${breadth.total} tracked tickers' trend signals and today's price moves — a real but small-universe number, not a true NYSE/Nasdaq advance-decline line (no free data source for that exists here).<br>
+      <b>Factor Crowding</b>: average pairwise 60-day return correlation across tracked equities (ETFs excluded). Higher correlation can indicate crowded, correlated positioning, but this is a rough proxy computed from price data, not a real positioning/flows metric (those need 13F holdings, short-interest, or ETF-flow data this app doesn't have).
     </div>
   </div>`;
 }
@@ -1558,6 +2128,18 @@ function renderRefreshModal(){
           Include dividends + news sentiment (+2 calls/ticker)${isPriceOnly?" — requires full mode":""}
         </label>
         <div class="warn-box">Alpha Vantage free tier allows 25 requests/day. This scope needs up to ${callsNeeded} calls (${perTicker}/ticker${isPriceOnly?" — price only":state.includeExtras?" — 1 price, 1 fundamentals, 1 dividends, 1 news sentiment":" — 1 price, 1 fundamentals"} + 1 shared SPY benchmark pull). Without an API key configured on the server, this regenerates mock data instead of pulling live data — see README.md.</div>
+        <div class="val-divider"></div>
+        <div>
+          <div class="stat-label" style="margin-bottom:8px;">Fundamentals for Valuation (SEC EDGAR) — free, no daily cap</div>
+          <div class="footnote" style="margin-bottom:8px;">Pulls real revenue, EBITDA, total debt, cash, and shares outstanding straight from SEC filings for the Valuation tab's DCF/Multiples/LBO calculations (equities only — ETFs are skipped, uses the scope selected above). This moves quarterly, not daily, so there's no need to run it every session. No API key needed, but set <code>SEC_EDGAR_CONTACT</code> in <code>.env</code> first — SEC asks every consumer to identify themselves.</div>
+          <button class="secondary-btn" id="startFundamentalsBtn" ${job && job.status==="running" ? "disabled":""}>${job && job.status==="running" && job.kind==="fundamentals" ? "Pulling…" : "⇩ Pull Fundamentals"}</button>
+        </div>
+        <div class="val-divider"></div>
+        <div>
+          <div class="stat-label" style="margin-bottom:8px;">Market Pulse (VIX proxy + Put/Call) — Alpha Vantage, 2 calls</div>
+          <div class="footnote" style="margin-bottom:8px;">Pulls VIXY (volatility-regime proxy) and the SPY options put/call ratio (market-wide sentiment) for the Market Pulse tab. Breadth and factor-crowding on that tab are computed live from data already on hand — no extra calls needed for those. Without an API key this regenerates illustrative mock values instead.</div>
+          <button class="secondary-btn" id="startMarketPulseBtn" ${job && job.status==="running" ? "disabled":""}>${job && job.status==="running" && job.kind==="marketpulse" ? "Pulling…" : "⇩ Refresh Market Pulse"}</button>
+        </div>
         ${job ? `
         <div>
           <div class="stat-label" style="margin-bottom:8px;">Progress — ${job.completed}/${job.total} · ${job.status}</div>
@@ -1797,6 +2379,31 @@ async function startRefresh(){
     alert("Could not reach the local server. Is it running? (node server.js)");
   }
 }
+async function startFundamentalsRefresh(){
+  const tickers = refreshScopeTickers();
+  try{
+    const resp = await fetch("/api/refresh-fundamentals", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ tickers }) });
+    const json = await resp.json();
+    if(!resp.ok){ alert(json.error || "Fundamentals pull failed to start."); return; }
+    state.job = { id:json.jobId, kind:"fundamentals", total:json.total, completed:0, log:["Fundamentals pull started…"], status:"running" };
+    renderRefreshModal();
+    pollJob();
+  } catch(e){
+    alert("Could not reach the local server. Is it running? (node server.js)");
+  }
+}
+async function startMarketPulseRefresh(){
+  try{
+    const resp = await fetch("/api/refresh-market-pulse", { method:"POST" });
+    const json = await resp.json();
+    if(!resp.ok){ alert(json.error || "Market Pulse refresh failed to start."); return; }
+    state.job = { id:json.jobId, kind:"marketpulse", total:json.total, completed:0, log:["Market Pulse refresh started…"], status:"running" };
+    renderRefreshModal();
+    pollJob();
+  } catch(e){
+    alert("Could not reach the local server. Is it running? (node server.js)");
+  }
+}
 async function startImport(){
   if(!state.importRows || !state.importRows.length) return;
   try{
@@ -1870,6 +2477,24 @@ function attachHandlers(){
     render();
   }));
 
+  const valuationSelect=document.getElementById("valuationSelect");
+  if(valuationSelect) valuationSelect.addEventListener("change",()=>{ state.valuationTicker=valuationSelect.value; render(); });
+  document.querySelectorAll("[data-vmethod]").forEach(el=>el.addEventListener("click",()=>{ state.valuationMethod=el.dataset.vmethod; render(); }));
+  document.querySelectorAll("[data-vwaccmode]").forEach(el=>el.addEventListener("click",()=>{ getVA(state.valuationTicker).dcf.waccMode=el.dataset.vwaccmode; render(); }));
+  document.querySelectorAll("[data-vpeer]").forEach(el=>el.addEventListener("click",()=>{
+    const p=el.dataset.vpeer; const ms=getVA(state.valuationTicker).multiples;
+    if(ms.peerSet.includes(p)) ms.peerSet=ms.peerSet.filter(x=>x!==p); else ms.peerSet.push(p);
+    render();
+  }));
+  document.querySelectorAll("[data-vfield]").forEach(el=>el.addEventListener("change",()=>{
+    const path=el.dataset.vfield, unit=el.dataset.vunit;
+    let v=parseFloat(el.value);
+    if(isNaN(v)) return;
+    if(unit==="pct") v=v/100;
+    setVAField(state.valuationTicker, path, v);
+    render();
+  }));
+
   document.querySelectorAll("[data-sort]").forEach(el=>el.addEventListener("click",()=>{
     const col=el.dataset.sort;
     if(state.screenerSort.col===col) state.screenerSort.dir = state.screenerSort.dir==="asc"?"desc":"asc";
@@ -1899,6 +2524,11 @@ function attachHandlers(){
   if(includeExtrasCheckbox) includeExtrasCheckbox.addEventListener("change",()=>{ state.includeExtras=includeExtrasCheckbox.checked; render(); });
   const startBtn=document.getElementById("startRefreshBtn");
   if(startBtn) startBtn.addEventListener("click",startRefresh);
+  const startFundBtn=document.getElementById("startFundamentalsBtn");
+  if(startFundBtn) startFundBtn.addEventListener("click",startFundamentalsRefresh);
+
+  const startMarketPulseBtn=document.getElementById("startMarketPulseBtn");
+  if(startMarketPulseBtn) startMarketPulseBtn.addEventListener("click",startMarketPulseRefresh);
 
   const openImportModal=document.getElementById("openImportModal");
   if(openImportModal) openImportModal.addEventListener("click",async ()=>{ state.importModalOpen=true; state.importRows=null; state.importError=null; await pingServer(); render(); });

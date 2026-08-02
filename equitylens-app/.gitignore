@@ -2,4 +2,5 @@ node_modules/
 .env
 data/data.json
 data/av-usage.json
+data/edgar-ticker-cik.json
 *.log
